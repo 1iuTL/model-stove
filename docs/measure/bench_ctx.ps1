@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Continue'
 $exe   = 'C:\deepseek harness\models\llama-cpp\llama-server.exe'
-$model = 'D:\Bonsai-27B-Q1_0.gguf'
+$model = 'F:\models-archive\Bonsai-27B-Q1_0.gguf'
 $out   = 'C:\deepseek harness\_ctx_audit\bench.log'
 Set-Content -Path $out -Value "Bonsai 27B Q1_0 / q4_0 KV / fa on / np 1" -Encoding UTF8
 

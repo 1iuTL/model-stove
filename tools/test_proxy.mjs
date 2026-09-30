@@ -13,7 +13,7 @@ rmSync(TMP, { recursive: true, force: true })
 mkdirSync(TMP, { recursive: true })
 
 const BIN = 'C:\\deepseek harness\\models\\llama-prism\\llama-server.exe'
-const MODEL = 'D:\\Ternary-Bonsai-2-27B-PTQ1_0.gguf'
+const MODEL = 'F:\\models-archive\\Ternary-Bonsai-2-27B-PTQ1_0.gguf'
 const MODEL_PORT = 8096
 const PROXY_PORT = 8095
 

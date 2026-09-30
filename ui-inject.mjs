@@ -24,7 +24,7 @@
 //   - **拖动改成拖标题栏**(面板里那行「任务档位」),而不是拖按钮本身
 //   - 面板用 <details> 实现开合 —— 纯 HTML 行为,不吃长按、不需要脚本
 //   - 标题旁边有个版本标记,用来一眼确认手机上跑的是哪一版
-export const PANEL_VERSION = 3
+export const PANEL_VERSION = 4
 
 export const PANEL_HTML = `<div id="stove-panel">
   <button id="stove-toggle" type="button" title="任务档位">档位</button>
@@ -35,6 +35,7 @@ export const PANEL_HTML = `<div id="stove-panel">
     </div>
     <div id="stove-list"></div>
     <div id="stove-note"></div>
+    <button type="button" id="stove-copy">复制最后一个代码块</button>
     <label class="stove-opt"><input type="checkbox" id="stove-compress" /> 自动压缩上下文</label>
     <div class="stove-tip">拖这行标题可移动面板 · <a id="stove-reset" href="#">复位</a></div>
   </div>
@@ -73,6 +74,12 @@ export const PANEL_CSS = `
 #stove-list button.sel{background:#1f6feb;border-color:#1f6feb;color:#fff}
 #stove-list .d{display:block;font-size:11px;opacity:.75;margin-top:2px}
 #stove-note{font-size:11px;color:#8b949e;margin:6px 0}
+/* 复制产物按钮:样式与档位按钮一致,成功时变绿 */
+#stove-copy{display:block;width:100%;text-align:center;margin:0 0 2px;
+  background:#21262d;color:#e6edf3;border:1px solid #30363d;border-radius:7px;
+  padding:7px 9px;cursor:pointer;font:inherit}
+#stove-copy:hover{border-color:#58a6ff}
+#stove-copy.ok{background:#238636;border-color:#238636;color:#fff}
 .stove-opt{display:flex;align-items:center;gap:6px;font-size:12px;
   color:#c9d1d9;cursor:pointer;padding-top:7px;border-top:1px solid #30363d}
 .stove-tip{font-size:10.5px;color:#6e7681;margin-top:7px;text-align:center}
@@ -112,8 +119,23 @@ export const PANEL_JS = `
         list.appendChild(b);
       })(avail[i]);
     }
-    note.textContent = s.profile.label + ' · ' + (s.profile.thinking ? '思考开' : '思考关') +
-      (s.context && s.context.nCtx ? ' · 上下文 ' + s.context.nCtx : '');
+    // ⚠ 2026-09-30:档位在**请求层**覆盖采样参数与思考开关,会盖住 Web UI 侧栏里的
+    //   设置(档位说了算 —— 见 context-proxy.mjs "应用任务档位"那段的设计说明)。
+    //   以前界面完全不说明,用户在侧栏改温度会"改了没效果"。现在把接管项摆出来。
+    var pr = s.profile.params || {};
+    var ov = [];
+    if (pr.temperature !== undefined) ov.push('温度' + pr.temperature);
+    if (pr.top_p !== undefined) ov.push('top_p ' + pr.top_p);
+    if (pr.top_k !== undefined) ov.push('top_k ' + pr.top_k);
+    if (pr.repeat_penalty !== undefined) ov.push('重复' + pr.repeat_penalty);
+    if (pr.presence_penalty !== undefined) ov.push('存在' + pr.presence_penalty);
+    ov.push('思考' + (s.profile.thinking ? '开' : '关'));
+    if (s.profile.systemAdd) ov.push('输出约束');
+    note.textContent = s.profile.label + ' · 本档接管:' + ov.join('/') + '(会盖住侧栏设置)' +
+      (s.context && s.context.nCtx
+        // (兜底值) = 代理没读到上游 /props,这个数是猜的,压缩阈值会算错
+        ? ' · 上下文 ' + s.context.nCtx + (s.context.fallback ? '(兜底值)' : '')
+        : '');
     var cb = $('stove-compress');
     cb.disabled = false;
     cb.checked = !!(s.compression && s.compression.enabled);
@@ -138,6 +160,66 @@ export const PANEL_JS = `
         load();
       })
       .catch(function () { $('stove-note').textContent = '切换失败'; });
+  }
+
+  // ---------- 复制产物(只复制最后一个代码块)----------
+  //
+  // 为什么需要:三个模型都会在产物**之后**追加说明文字(qwen36 还多带一个 markdown
+  // 表格),在聊天里全选复制会把这些一起带走。提示词约束能治这个,但实测会把产物
+  // 一起砍瘦(详见 src/profiles.js 的实测记录),所以改在"取用"这一步解决 ——
+  // 只取最后一个代码块的内容,尾巴自然就被排除在外了。
+  //
+  // ⚠ 手机上这个页面是 http(非安全上下文),**navigator.clipboard 不可用** ——
+  //   必须回落到 textarea + execCommand('copy'),否则手机上点了没任何反应。
+  function lastCodeText() {
+    var codes = document.querySelectorAll('pre code');
+    if (codes.length) return codes[codes.length - 1].textContent;
+    var pres = document.querySelectorAll('pre');
+    if (pres.length) return pres[pres.length - 1].textContent;
+    return null;
+  }
+
+  function legacyCopy(text) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.top = '-1000px';
+    document.body.appendChild(ta);
+    ta.select();
+    try { ta.setSelectionRange(0, text.length); } catch (e) {}
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    document.body.removeChild(ta);
+    return ok;
+  }
+
+  function flash(btn, msg, ok) {
+    if (!btn) return;
+    if (!btn.getAttribute('data-orig')) btn.setAttribute('data-orig', btn.textContent);
+    btn.textContent = msg;
+    btn.className = ok ? 'ok' : '';
+    setTimeout(function () {
+      btn.textContent = btn.getAttribute('data-orig');
+      btn.className = '';
+    }, 1800);
+  }
+
+  function copyArtifact() {
+    var btn = $('stove-copy');
+    var text = lastCodeText();
+    if (!text) { flash(btn, '没找到代码块', false); return; }
+    var done = function (ok) {
+      flash(btn, ok ? ('已复制 ' + text.length + ' 字符') : '复制失败,请长按选择', ok);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(
+        function () { done(true); },
+        function () { done(legacyCopy(text)); }
+      );
+    } else {
+      done(legacyCopy(text));
+    }
   }
 
   // ---------- 拖动(拖标题栏,不是拖按钮)----------
@@ -284,6 +366,10 @@ export const PANEL_JS = `
       };
     }
 
+    // 防御:HTML 与脚本是两个独立请求,可能其中一个被缓存成旧版(旧 HTML 没有这个
+    // 按钮)。取不到就别绑定,绝不能因此让后面的 bindDrag/load 一起挂掉。
+    var copyBtn = $('stove-copy');
+    if (copyBtn) copyBtn.onclick = copyArtifact;
     bindDrag();
     load();
     return true;

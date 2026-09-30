@@ -2,7 +2,7 @@
 # Chinese prompts live in prompts.json; model replies are written to files for diffing.
 $ErrorActionPreference = 'Continue'
 $exe     = 'C:\deepseek harness\models\llama-cpp\llama-server.exe'
-$model   = 'D:\Bonsai-27B-Q1_0.gguf'
+$model   = 'F:\models-archive\Bonsai-27B-Q1_0.gguf'
 $out     = 'C:\deepseek harness\_ctx_audit\kv3.log'
 $dir     = 'C:\deepseek harness\_ctx_audit\kvout'
 New-Item -ItemType Directory -Force -Path $dir | Out-Null

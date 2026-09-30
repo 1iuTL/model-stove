@@ -67,7 +67,7 @@ function Run-One([string]$file, [string]$label, [int]$ctx, [string]$kv) {
   Start-Sleep -Seconds 5
 }
 
-$abl = 'D:\Ternary-Bonsai-2-27B-Abliterated-PTQ1_0.gguf'
+$abl = 'F:\models-archive\Ternary-Bonsai-2-27B-Abliterated-PTQ1_0.gguf'
 $her = 'D:\Ternary-Bonsai-2-27B-Heretic-PTQ1_0.gguf'
 
 # Main model first. 64K is the shipped preset; 96K is the measured ceiling;

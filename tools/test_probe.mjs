@@ -22,7 +22,7 @@ const { MODELS } = require('../src/config.js');
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const EXE = 'C:\\deepseek harness\\models\\llama-prism\\llama-server.exe';
-const MODEL_FILE = 'D:\\Ternary-Bonsai-2-27B-Abliterated-PTQ1_0.gguf';
+const MODEL_FILE = 'F:\\models-archive\\Ternary-Bonsai-2-27B-Abliterated-PTQ1_0.gguf';
 const PORT = 8099;
 const BASE = `http://127.0.0.1:${PORT}`;
 const LOG = path.join(ROOT, '_probe_test_server.log');

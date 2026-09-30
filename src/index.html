@@ -616,7 +616,13 @@ function renderPresets() {
     b.innerHTML = `<div class="t">${p.label}${p.vision ? ' · 视觉' : ''}</div>
       <div class="d">${p.hint}</div>`;
     // 点预设把滑块带回该预设的上下文,之后仍可自由拖动微调。
-    b.onclick = () => { selPreset = p.key; selCtx = p.ctx; renderPresets(); renderCtx(); refreshButtons(); };
+    // ⚠ 2026-09-29:把 selCtx = p.ctx 改成 selCtx = null,即"跟随预设"。
+    //   原来直接写死预设的数字,等于把它变成了**用户显式选择**,
+    //   从而绕过按 KV 精度做的安全夹取 —— 三值模型 + q8_0(安全 49152)
+    //   配"长文本 64K"预设(65536)就会静默掉到 1/6~1/8 速度。
+    //   置 null 之后由 renderCtx() 显示、由 config.js 的 buildArgs() 取数,
+    //   两处都按当前 KV 精度夹到安全上限。用户之后手动拖滑块仍是显式选择。
+    b.onclick = () => { selPreset = p.key; selCtx = null; renderPresets(); renderCtx(); refreshButtons(); };
     box.appendChild(b);
   }
 }
@@ -669,6 +675,26 @@ function budgetHint() {
   const note = $('budgetNote');
   if (!note) return;
   const b = (CATALOGUE.budgets || []).find((x) => x.key === selBudget);
+
+  // 2026-09-29 新增:预算 ↔ 上下文 一致性检查。
+  //
+  // 这两个都是**启动参数**,彼此完全不知道对方存在。预算不小于上下文时,
+  // 思考能把上下文整个吃光,正文就没地方放了 —— 这是"空回答"的另一条独立路径
+  // (与"客户端 max_tokens 小于思考长度"那条不同,那条我们管不着)。
+  //
+  // 实测(2026-09-29,本机):预算 16384 > 输出上限 12288 时,同一个模型给出
+  // 31185 字思考、**正文 0 字**,而且思考断在半个词中间。
+  //
+  // 顺带说明为什么护栏放这里而不是代理里:代理里原本有一处 `reasoning_budget = 4096`,
+  // 但那个字段名是错的(正确名 `reasoning_budget_tokens`),从来没生效过 —— 已删。
+  const preset = (CATALOGUE.presets || []).find((x) => x.key === selPreset);
+  const ctx = selCtx || (preset ? preset.ctx : null);
+  if (b && b.value > 0 && ctx && b.value >= ctx) {
+    note.textContent = ` ⚠ 预算 ${fmtCtx(b.value)} ≥ 上下文 ${fmtCtx(ctx)}` +
+      `:思考会把上下文吃光,正文没地方放(空回答)`;
+    return;
+  }
+
   note.textContent = b && b.value < 0 ? '(不限,不干预)' : '';
 }
 
@@ -728,6 +754,15 @@ function renderKv() {
       selKv = k.key;
       saveKv();
       // 精度一换,安全区就变 —— 上下文那边必须跟着重画,否则会显示错的上界。
+      //
+      // ⚠ 2026-09-29:光重画不够,还得把**值**夹回来。renderCtx() 结尾会执行
+      //   `selCtx = steps[idx]`,把"跟随预设"的 null 钉成具体数字;于是
+      //   "先选预设、再切 KV"这条路径手里拿的还是旧精度下的值 ——
+      //   三值模型 q4_0 安全 98304,预设 65536 没问题;一旦切到 q8_0(安全 49152),
+      //   65536 会原地留着 → 静默溢出、速度掉 6-8 倍,而界面只标一个 ⚠。
+      //   这里按新精度夹一次,与 config.js 对"预设来源"的夹取语义保持一致。
+      const s = safeCtxNow();
+      if (selCtx && s && selCtx > s) selCtx = s;
       renderKv(); renderCtx(); refreshButtons();
     };
     box.appendChild(b);
@@ -782,11 +817,19 @@ function renderCtx() {
   input.max = String(steps.length - 1);
   input.step = '1';
 
+  // 安全上限先算出来 —— 下面夹预设值要用它,而它随当前 KV 精度变。
+  const safe = safeCtxNow() || steps[steps.length - 1];
+
   // 当前值吸附到最近的合法档位 —— 换了模型之后,原值可能已经越界。
   let cur = selCtx;
   if (cur === null || cur === undefined) {
     const p = (CATALOGUE.presets || []).find((x) => x.key === selPreset);
     cur = p ? p.ctx : steps[steps.length - 1];
+    // ⚠ 2026-09-29:预设来源的值也要夹到安全上限。预设 ctx 是固定数字,
+    //   安全上限却随 KV 精度变(三值模型 q8_0 只有 49152,而"长文本 64K"是 65536)。
+    //   必须和 config.js 的 buildArgs() 夹得**一致**,否则会出现
+    //   "界面显示 64K、实际以 48K 启动"这种对不上的状态。
+    if (cur > safe) cur = safe;
   }
   let idx = 0;
   for (let i = 0; i < steps.length; i++) {
@@ -794,8 +837,6 @@ function renderCtx() {
   }
   input.value = String(idx);
   selCtx = steps[idx];
-
-  const safe = safeCtxNow() || steps[steps.length - 1];
   const max = steps[steps.length - 1];
   const over = selCtx > safe;
 
@@ -814,19 +855,44 @@ function renderCtx() {
 
   const note = $('ctxNote');
   note.classList.toggle('warn', over);
+  // 文案里的数字都从当前模型取,不写死 —— 写死过一次,加了新模型就成了事实错误。
+  const cm = currentModel() || {};
+  const pt = cm.probeTps;      // 本模型实测基线 tok/s(没有就不编数字)
+  const kl = cm.kvLayers;      // 混合注意力:总层数 / 带 KV 的层数
   if (!model) {
     note.textContent = '';
   } else if (over) {
     note.innerHTML = `已超过 <b>${currentKv() || ''}</b> 精度下、本机实测的安全上限 ` +
       `<b>${fmtCtx(safe)}</b>。超过后 KV cache 被挪到内存、注意力改由 CPU 算,` +
       `<b>速度掉约 6-8 倍而且不报错</b>` +
-      `(实测 224K 时从 41 掉到 6.4 tok/s)。<br />` +
-      `想开更大:把 KV 精度换回 q4_0,或换权重更小的模型。`;
+      (pt ? `(本模型实测基线约 ${pt} t/s,也就是掉到 ${Math.max(1, Math.round(pt / 7))} t/s 左右)` : '') +
+      `。<br />`;
+    // ⚠ 2026-09-30:原文案写死"把 KV 精度换回 q4_0" —— 当用户**已经**是 q4_0 时,
+    //   那是一句空话(它写于"q8_0 才是瓶颈"的年代)。现在按当前精度分支,
+    //   并补上实测存在、但文案里从没提过的第三条路:把 --n-cpu-moe 调大,
+    //   让更多专家留在内存、腾出显存给上下文(代价是生成变慢)。
+    const kvNow = currentKv() || '';
+    const altSafe = (cm.safeCtx || {})[kvNow === 'q8_0' ? 'q4_0' : 'q8_0'];
+    const upHint = kvNow === 'q8_0'
+      ? `想开更大:把 KV 精度换回 <b>q4_0</b>${altSafe ? `(安全上限 ${fmtCtx(altSafe)})` : ''},或换权重更小的模型。`
+      : `想开更大:当前已是 <b>${kvNow}</b>。要么换权重更小的模型,要么把 <b>--n-cpu-moe 调大</b>` +
+        `腾出显存给上下文(实测:<code>28</code> 档 5910 MiB vs <code>24</code> 档 7086 MiB,` +
+        `少占约 1.2 GB;代价是生成变慢)。`;
+    note.innerHTML += upHint;
   } else {
-    note.innerHTML = `这两个模型是<b>混合注意力</b>架构(64 层里只有 16 层带 KV cache),` +
+    // ⚠ 2026-09-29:这里原来写死"这两个模型…64 层里只有 16 层带 KV cache"。
+    //   加了 Qwen3.6/3.8-35B-A3B(40 层 / 10 层)之后,那句话就是**事实错误**了。
+    //   改成从模型的 kvLayers 取数;没有该字段时退回一句不含具体数字的说法。
+    note.innerHTML = (kl
+      ? `这个模型是<b>混合注意力</b>架构(${kl.total} 层里只有 ${kl.withKv} 层带 KV cache),`
+      : `这个模型是<b>混合注意力</b>架构(只有一部分层带 KV cache),`) +
       `所以上下文比同尺寸普通模型便宜得多 —— 吃显存的从来是权重,不是上下文。` +
       `<br />提高 KV 精度会让 KV 变大,安全上限随之减半。`;
   }
+
+  // 预算与上下文是两个独立的启动参数,换模型/换 KV/拖上下文之后
+  // 预算提示可能已经过期 —— 这里保持一致(见 budgetHint 的说明)。
+  budgetHint();
 }
 
 function saveCtx() {

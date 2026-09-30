@@ -25,8 +25,8 @@ const PORT = 8099
 const Q2_PATH = 'C:\\deepseek harness\\_pq2_0.gguf'
 
 const MODELS = [
-  { name: 'Q1_0 1-bit', file: 'D:\\Bonsai-27B-Q1_0.gguf', bin: 'C:\\deepseek harness\\models\\llama-cpp\\llama-server.exe', benchBin: 'C:\\deepseek harness\\models\\llama-cpp\\llama-bench.exe' },
-  { name: 'PTQ1_0 三值(现有)', file: 'D:\\Ternary-Bonsai-2-27B-PTQ1_0.gguf', bin: PRISM, benchBin: BENCH },
+  { name: 'Q1_0 1-bit', file: 'F:\\models-archive\\Bonsai-27B-Q1_0.gguf', bin: 'C:\\deepseek harness\\models\\llama-cpp\\llama-server.exe', benchBin: 'C:\\deepseek harness\\models\\llama-cpp\\llama-bench.exe' },
+  { name: 'PTQ1_0 三值(现有)', file: 'F:\\models-archive\\Ternary-Bonsai-2-27B-PTQ1_0.gguf', bin: PRISM, benchBin: BENCH },
   { name: 'PQ2_0 三值(新下)', file: Q2_PATH, bin: PRISM, benchBin: BENCH },
 ]
 

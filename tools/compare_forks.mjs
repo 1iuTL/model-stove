@@ -31,7 +31,7 @@ const BUILDS = [
   },
 ]
 const MODELS = [
-  { label: 'PTQ1_0', file: 'D:\\Ternary-Bonsai-2-27B-PTQ1_0.gguf' },
+  { label: 'PTQ1_0', file: 'F:\\models-archive\\Ternary-Bonsai-2-27B-PTQ1_0.gguf' },
   { label: 'Heretic', file: 'D:\\Ternary-Bonsai-2-27B-Heretic-PTQ1_0.gguf' },
 ]
 

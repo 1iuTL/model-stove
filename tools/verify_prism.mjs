@@ -14,9 +14,9 @@ const PROMPT = '解释反射定律'
 const BIN = 'C:\\deepseek harness\\models\\llama-prism\\llama-server.exe'
 
 const MODELS = [
-  { name: '三元版', file: 'D:\\Ternary-Bonsai-2-27B-PTQ1_0.gguf' },
+  { name: '三元版', file: 'F:\\models-archive\\Ternary-Bonsai-2-27B-PTQ1_0.gguf' },
   { name: 'Heretic', file: 'D:\\Ternary-Bonsai-2-27B-Heretic-PTQ1_0.gguf' },
-  { name: 'Abliterated', file: 'D:\\Ternary-Bonsai-2-27B-Abliterated-PTQ1_0.gguf' },
+  { name: 'Abliterated', file: 'F:\\models-archive\\Ternary-Bonsai-2-27B-Abliterated-PTQ1_0.gguf' },
 ]
 
 function analyse(text) {

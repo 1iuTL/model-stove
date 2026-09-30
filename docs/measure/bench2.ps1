@@ -34,8 +34,8 @@ function Run-One([string]$model, [string]$label, [int]$ctx, [string]$kvk, [strin
   Start-Sleep -Seconds 4
 }
 
-$q1  = 'D:\Bonsai-27B-Q1_0.gguf'
-$ter = 'D:\Ternary-Bonsai-2-27B-PTQ1_0.gguf'
+$q1  = 'F:\models-archive\Bonsai-27B-Q1_0.gguf'
+$ter = 'F:\models-archive\Ternary-Bonsai-2-27B-PTQ1_0.gguf'
 
 Run-One $q1  'Q1_0'    163840 'q4_0' 'q4_0'
 Run-One $q1  'Q1_0'    196608 'q4_0' 'q4_0'

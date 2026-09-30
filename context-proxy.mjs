@@ -31,6 +31,17 @@ const { profiles: PROFILES, defaultProfile, resolve: resolveProfile } = require(
 
 const PROXY_PORT = Number(process.env.PROXY_PORT || 8092)
 const UPSTREAM = process.env.UPSTREAM || 'http://127.0.0.1:8091'
+// ⚠ 2026-09-30:上游开了 --api-key 时,代理**自己发起的**请求也必须带 key。
+//   以前只有"转发客户端请求"那条路带(那条原样透传客户端 headers),而代理自己发的
+//   两类请求 —— ① 读 /props 拿 n_ctx  ② 压缩时调 chat/completions —— 都是裸请求,
+//   于是全部 401。后果:
+//     · 界面「上下文」永远显示 —(一直用 65536 兜底,压缩阈值跟着算错)
+//     · 自动压缩直接失败
+//   llama-server 日志里每 15 秒一条 `unauthorized: Invalid API Key` 就是它。
+const UPSTREAM_KEY = (process.env.UPSTREAM_KEY || '').trim()
+const upHeaders = (extra) => (UPSTREAM_KEY
+  ? { ...(extra || {}), Authorization: `Bearer ${UPSTREAM_KEY}` }
+  : (extra || {}))
 const UPSTREAM_URL = new URL(UPSTREAM)
 
 // 日志与状态文件的位置。
@@ -85,7 +96,11 @@ const state = {
 function loadState() {
   try {
     const saved = JSON.parse(readFileSync(STATE_FILE, 'utf8'))
-    if (typeof saved.enabled === 'boolean') state.enabled = saved.enabled
+    // ⚠ 2026-09-30:环境变量以前是**失效**的 —— 这行在 state 初始化之后执行,
+    //   会把 `enabled: process.env.COMPRESS !== '0'` 的结果盖回来,于是
+    //   `COMPRESS=0` 明明设了却不生效(又一个"声明了但不生效"的配置)。
+    //   现在:显式设了 COMPRESS 就以它为准,没设才用状态文件里的值。
+    if (typeof saved.enabled === 'boolean' && process.env.COMPRESS === undefined) state.enabled = saved.enabled
     if (typeof saved.thresholdRatio === 'number') state.thresholdRatio = saved.thresholdRatio
     if (Number.isInteger(saved.keepRecentTurns)) state.keepRecentTurns = saved.keepRecentTurns
     if (typeof saved.profile === 'string' && PROFILES.some((p) => p.key === saved.profile)) {
@@ -132,18 +147,24 @@ function estimateMessagesTokens(messages) {
 
 /** 读取上游 /props,拿到真实的 n_ctx。缓存一份,失败时用兜底值。 */
 let ctxCache = { value: null, at: 0 }
+// 这个数是不是**兜底值**。必须让面板能区分 —— 否则拿不到 /props 时,
+// 面板会把 65536 当成真实读数;而真实 ctx 可能是 32768,
+// 那样压缩阈值(65536 × 0.75 = 49152)永远触发不了,长对话直接顶到上下文上限。
+let ctxFallback = false
 async function getContextSize() {
   if (ctxCache.value && Date.now() - ctxCache.at < 60000) return ctxCache.value
   try {
-    const r = await fetch(`${UPSTREAM}/props`, { signal: AbortSignal.timeout(8000) })
+    const r = await fetch(`${UPSTREAM}/props`, { headers: upHeaders(), signal: AbortSignal.timeout(8000) })
     const j = await r.json()
     const n = j.default_generation_settings?.n_ctx
     if (Number.isInteger(n) && n > 0) {
       ctxCache = { value: n, at: Date.now() }
+      ctxFallback = false
       return n
     }
   } catch { /* 上游没起来 */ }
-  log('警告:拿不到上游 n_ctx,暂用 65536 兜底')
+  ctxFallback = true
+  log('警告:拿不到上游 n_ctx,暂用 65536 兜底(状态接口会标 fallback,面板上显示"(兜底值)")')
   return ctxCache.value || 65536
 }
 
@@ -151,7 +172,8 @@ async function getContextSize() {
 async function upstreamComplete(messages, maxTokens) {
   const r = await fetch(`${UPSTREAM}/v1/chat/completions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    // 带 key:上游开鉴权时,这条"压缩总结"用的补全请求同样要过锁
+    headers: upHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({
       model: 'local',
       messages,
@@ -159,14 +181,18 @@ async function upstreamComplete(messages, maxTokens) {
       stream: false,
       // 总结任务不需要思考,关掉它。
       //
-      // 注意:这里标 reasoning_budget:0 是"顺手明确意图",**不是**性能关键。
-      // 曾经误以为它把总结从 35s 降到 3s,后来用连发三次的对照实验证明:
+      // ⚠ 2026-09-29:删掉了这里原本的 `reasoning_budget: 0` —— 字段名是错的
+      // (正确名是 `reasoning_budget_tokens`,服务端不加别名),它从来没生效过。
+      // 真正让总结不思考的是下面那行 `enable_thinking: false`(合法 kwarg),
+      // 所以删掉**不会有任何行为变化**,只是不再在代码里留一个假机制。
+      //
+      // 下面这条教训保留,它是个好教训:
+      // 曾经误以为该参数把总结从 35s 降到 3s,后来用连发三次的对照实验证明,
       // 真正的差异来自**首次请求预热**(模型加载后第一次推理要建 CUDA 图、
       // 分配 KV cache,约 32s),第二次起就只要 0.8-2.9s。
       // 教训:同一进程里先后跑多个配置,后者天然更快,很容易把预热误当成
       // 参数效果 —— 对比时必须重复或打乱顺序。
       chat_template_kwargs: { enable_thinking: false },
-      reasoning_budget: 0,
     }),
     signal: AbortSignal.timeout(300000),
   })
@@ -375,9 +401,16 @@ const server = http.createServer(async (req, res) => {
           hint: cur.hint,
           thinking: cur.thinking,
           params: cur.params,
+          // 界面要据此显示"本档是否加了输出约束",所以必须一并返回
+          systemAdd: cur.systemAdd || null,
           available: PROFILES.map((p) => ({ key: p.key, label: p.label, hint: p.hint })),
         },
-        context: { nCtx, triggerAt: nCtx ? Math.floor(nCtx * state.thresholdRatio) : null },
+        context: {
+          nCtx,
+          triggerAt: nCtx ? Math.floor(nCtx * state.thresholdRatio) : null,
+          // true = 这个 nCtx 是拿不到 /props 时的兜底值,不是真实读数(见 getContextSize)
+          fallback: ctxFallback,
+        },
         stats: { compressCount: state.compressCount, lastCompressAt: state.lastCompressAt, lastReason: state.lastReason },
         upstream: UPSTREAM,
       }, null, 2))
@@ -442,17 +475,40 @@ const server = http.createServer(async (req, res) => {
     try {
       const p = resolveProfile(state.profile)
       Object.assign(body, p.params)
-      // 思考开关走模板参数。开思考时顺便给个预算上限,免得又出现
-      // "思考吃光整个输出预算、正文为空"的情况。
+      // 思考开关走模板参数 —— 这条是**有效**的:enable_thinking 是合法的
+      // chat_template_kwargs,关思考靠的就是它。
       body.chat_template_kwargs = {
         ...(body.chat_template_kwargs || {}),
         enable_thinking: p.thinking,
       }
-      if (p.thinking && body.reasoning_budget === undefined) {
-        body.reasoning_budget = 4096
-      } else if (!p.thinking) {
-        body.reasoning_budget = 0
+      // 输出约束(可选,定义见 src/profiles.js 的 systemAdd)。
+      // 为什么放在这里:Model Stove 原本**完全不注入系统提示词** —— Web UI 发什么
+      // 就转发什么。而实测三个模型都会在产物结束后追加说明文字(见 profiles.js 注释)。
+      // 已有系统提示时**追加**而不是覆盖,免得把用户自己的系统提示顶掉。
+      // 注意:这会改变请求前缀,所以切换档位时首轮会丢一次前缀缓存 —— 可接受。
+      if (p.systemAdd && Array.isArray(body.messages)) {
+        const sysMsgs = body.messages.filter((m) => m.role === 'system')
+        if (sysMsgs.length) {
+          sysMsgs.forEach((m) => { m.content = String(m.content || '') + '\n\n' + p.systemAdd })
+        } else {
+          body.messages.unshift({ role: 'system', content: p.systemAdd })
+        }
       }
+      // ⚠ 2026-09-29 删掉两行**从来没生效过**的预算写入。原文是:
+      //     if (p.thinking && body.reasoning_budget === undefined) body.reasoning_budget = 4096
+      //     else if (!p.thinking) body.reasoning_budget = 0
+      //   注释声称"免得又出现思考吃光整个输出预算、正文为空的情况"。但从服务端源码
+      //   与两个内核二进制的精确字面量核对下来,这两行是空写:
+      //     - 请求级字段名是 `reasoning_budget_tokens`,**不存在** `reasoning_budget`
+      //       (llama.cpp tools/server/server-schema.cpp 只声明前者,没有加别名)
+      //     - server-common.cpp:1354 的取值逻辑是 `json_value(body,
+      //       "reasoning_budget_tokens", -1)`,只有拿到 -1 才回落到服务端
+      //       `--reasoning-budget`
+      //   所以护栏从未生效,真正生效的一直是服务端启动参数 —— 也就是
+      //   src/config.js 里侧栏选的那个档位,即**侧栏才是权威**。
+      //   "思考吃光预算"这个风险是真的,但不该在这里偷偷钉一个 4096:
+      //   正确位置是界面上"预算 vs 上下文"的一致性检查(见 src/index.html
+      //   的 budgetHint()),这样既补上漏洞,又不牺牲长思考的质量。
     } catch (e) {
       log(`应用档位失败(${e.message}),按原请求转发`)
     }

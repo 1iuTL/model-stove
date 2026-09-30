@@ -15,15 +15,18 @@
 const http = require('http');
 
 /** 发一个 POST JSON。不抛异常,失败收敛成 { ok:false }。 */
-function httpPostJson(base, pathname, payload, timeoutMs = 2500) {
+function httpPostJson(base, pathname, payload, timeoutMs = 2500, apiKey = '') {
   return new Promise((resolve) => {
     let url;
     try { url = new URL(pathname, base); } catch { return resolve({ ok: false, status: 0, body: '' }); }
     const data = Buffer.from(JSON.stringify(payload), 'utf8');
+    // ⚠ 2026-09-30:上游开了 --api-key 时探针也必须带 key,否则一律 401 ——
+    //   表现就是界面上「实测速度 未取得」,而模型其实跑得好好的。
+    const headers = { 'Content-Type': 'application/json', 'Content-Length': data.length };
+    if (apiKey) headers.Authorization = 'Bearer ' + apiKey;
     const req = http.request(
       url,
-      { method: 'POST', timeout: timeoutMs,
-        headers: { 'Content-Type': 'application/json', 'Content-Length': data.length } },
+      { method: 'POST', timeout: timeoutMs, headers },
       (res) => {
         let body = '';
         res.on('data', (d) => (body += d));
@@ -51,7 +54,7 @@ const SPILL_RATIO = 0.6;
  *
  * @param {string} base    llama-server 根地址,如 http://127.0.0.1:8091
  * @param {object} model   需要 model.probeTps(该模型的实测基线 tok/s)
- * @param {object} [opts]  { tokens, timeoutMs, alive } —— alive() 返回 false 则中止
+ * @param {object} [opts]  { tokens, timeoutMs, alive, apiKey } —— alive() 返回 false 则中止
  * @returns {Promise<object|null>} { tps, expected, ratio, spilled, at } 或 null
  *
  * 跑两次是**必须**的:模型加载后的第一次推理要建 CUDA 图,能吃掉二三十秒。
@@ -67,13 +70,14 @@ async function probeSpeed(base, model, opts = {}) {
   const timeoutMs = opts.timeoutMs || 300000;
   const alive = opts.alive || (() => true);
 
+  const apiKey = String(opts.apiKey || '');
   const body = { prompt: 'Hello', n_predict: tokens, stream: false, cache_prompt: false };
 
   // 第一次:预热。它会建 CUDA 图,耗时可观,结果直接丢弃。
-  await httpPostJson(base, '/completion', body, timeoutMs);
+  await httpPostJson(base, '/completion', body, timeoutMs, apiKey);
   if (!alive()) return null;
 
-  const r = await httpPostJson(base, '/completion', body, timeoutMs);
+  const r = await httpPostJson(base, '/completion', body, timeoutMs, apiKey);
   if (!r.ok) return null;
 
   let tps = null;

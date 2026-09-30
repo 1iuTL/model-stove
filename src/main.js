@@ -103,7 +103,8 @@ function runProbe(model) {
   if (s.probe === false) return;
   current.speed = { pending: true };
   notifyRenderer();
-  probeSpeed(BASE, model, { alive: () => !!child })
+  // apiKey:上游开了鉴权时探针也要带,否则 401 → 界面「实测速度 未取得」
+  probeSpeed(BASE, model, { alive: () => !!child, apiKey: (settings.readSettings().apiKey || '').trim() })
     .then((res) => {
       if (!child) return;                       // 服务已经停了,别乱写状态
       current.speed = res || { failed: true };
@@ -462,6 +463,9 @@ ipcMain.handle('catalogue', () => ({
     safeCtx: m.safeCtx || null,
     maxCtx: m.maxCtx || null,
     probeTps: m.probeTps || null,
+    // 混合注意力里"多少层带 KV cache" —— 界面用它生成解释文案,
+    // 而不是把某一种模型的层数写死在 HTML 里(那已经错过一次了)。
+    kvLayers: m.kvLayers || null,
   })),
   presets: Object.entries(PRESETS).map(([k, v]) => ({
     key: k, label: v.label, hint: v.hint, ctx: v.ctx, vision: v.vision,
@@ -958,7 +962,18 @@ function startProxy() {
         windowsHide: true,
         detached: true,
         cwd: REPO_ROOT,
-        env: { ...process.env, PROXY_PORT: String(PROXY_PORT), UPSTREAM: BASE },
+        // ⚠ 2026-09-30:必须把 API key 一起传给代理。代理**自己**会发起两类上游请求:
+        //   ① 读 /props 拿真实 n_ctx  ② 开了自动压缩时调 /v1/chat/completions。
+        //   以前只传了 UPSTREAM 地址,于是这两条全部 401:
+        //     · 界面「上下文」永远显示 —(一直用 65536 兜底,压缩阈值跟着算错)
+        //     · 自动压缩直接失败
+        //   日志里每 15 秒一条 `unauthorized: Invalid API Key` 就是它。
+        env: {
+          ...process.env,
+          PROXY_PORT: String(PROXY_PORT),
+          UPSTREAM: BASE,
+          UPSTREAM_KEY: (settings.readSettings().apiKey || '').trim(),
+        },
         stdio: ['ignore', fd, fd],
       });
     } catch (e) {

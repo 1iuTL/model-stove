@@ -35,8 +35,8 @@ function Run-One([string]$exe,[string]$model,[string]$label,[int]$ctx) {
 
 $prism = 'C:\deepseek harness\models\llama-prism\llama-server.exe'
 $stock = 'C:\deepseek harness\models\llama-cpp\llama-server.exe'
-$ter   = 'D:\Ternary-Bonsai-2-27B-PTQ1_0.gguf'
-$q1    = 'D:\Bonsai-27B-Q1_0.gguf'
+$ter   = 'F:\models-archive\Ternary-Bonsai-2-27B-PTQ1_0.gguf'
+$q1    = 'F:\models-archive\Bonsai-27B-Q1_0.gguf'
 
 Run-One $prism $ter 'Ternary+prism'  65536
 Run-One $prism $ter 'Ternary+prism'  98304

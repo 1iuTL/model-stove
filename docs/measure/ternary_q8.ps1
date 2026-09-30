@@ -3,7 +3,7 @@
 $ErrorActionPreference = 'Continue'
 $exe  = 'C:\deepseek harness\models\llama-prism\llama-server.exe'
 $out  = 'C:\deepseek harness\_ctx_audit\ternary_q8.log'
-$file = 'D:\Ternary-Bonsai-2-27B-Abliterated-PTQ1_0.gguf'
+$file = 'F:\models-archive\Ternary-Bonsai-2-27B-Abliterated-PTQ1_0.gguf'
 $prompts = Get-Content 'C:\deepseek harness\_ctx_audit\prompts.json' -Encoding UTF8 -Raw | ConvertFrom-Json
 Set-Content -Path $out -Value 'ctx | kv | run | content_len | max_run | tok/s | vram_peak | verdict' -Encoding UTF8
 

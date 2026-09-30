@@ -3,7 +3,7 @@
 # This one polls nvidia-smi concurrently with the image request.
 $ErrorActionPreference = 'Continue'
 $exe   = 'C:\deepseek harness\models\llama-prism\llama-server.exe'
-$model = 'D:\Ternary-Bonsai-2-27B-Abliterated-PTQ1_0.gguf'
+$model = 'F:\models-archive\Ternary-Bonsai-2-27B-Abliterated-PTQ1_0.gguf'
 $mmproj= 'D:\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf'
 $img   = 'C:\deepseek harness\models\test_report.png'
 $out   = 'C:\deepseek harness\_ctx_audit\vision_peak.log'

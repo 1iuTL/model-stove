@@ -4,6 +4,19 @@ const path = require('path');
 
 const MODELS_DIR = 'D:\\';
 
+// 归档盘。
+//
+// 2026-09-29 把三个不常用的模型移到 F 盘留档(D 盘让给日常用的 Heretic):
+//   Bonsai-27B-Q1_0 / Ternary-Bonsai-2-27B-PTQ1_0 / Ternary-Bonsai-2-27B-Abliterated-PTQ1_0
+// 搬运走的是"复制 -> SHA256 校验 -> 校验通过才删源文件",不是裸 Move-Item。
+//
+// ⚠ 两个注意点:
+//   1) F 盘是独立物理盘。不接上时,下面挂 ARCHIVE_DIR 的三个条目会启动失败 ——
+//      这是预期行为,它们只是留档,日常用的只有 MODELS_DIR 下那两个文件。
+//   2) `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf` 故意**留在 D 盘**:它是下面全局的
+//      MMPROJ,搬走会让**在用的 Heretic 版**视觉预设一起失效。别顺手把它也归档。
+const ARCHIVE_DIR = 'F:\\models-archive\\';
+
 // 三个 llama.cpp 构建:
 //   fast  —— **社区** sudoingX/llama.cpp 的 pr-ptq1-mmv 分支编出来的,含 PTQ1_0
 //            专用 mat-vec 内核,实测预填充快一倍(332 -> 769 t/s)。
@@ -97,6 +110,13 @@ const MMPROJ = 'D:\\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf';
 //
 //   W common_fit_params: failed to fit params to free device memory:
 //                        n_gpu_layers already set by user to 99, abort
+//
+// ⚠ 2026-09-29 更正:上面这行 warning **不能**当溢出判据,别再用它排查。
+//   实测它在启动后 0.5 秒就打印(模型还没开始载入),而那次是**健康**的:
+//   32K 上下文 / 显存 6590 MiB / 生成 30.0 t/s(正好等于该模型的实测基线)。
+//   原因:只要用户显式写了 `-ngl 99`,自动适配就被跳过并留下这句 —— 恒定出现,
+//   有溢出时出现、没溢出时也出现,零区分力。
+//   真正的溢出判据只有 tok/s(见下一段),warning 只能说明"自动适配没参与"。
 //
 // 然后把 KV cache 挪到主机内存、注意力改由 CPU 算 —— 不报错、不退出,
 // 只是慢 8 倍。实测 192K -> 224K 时显存读数几乎没变(7809 -> 7791),
@@ -239,8 +259,8 @@ const MODELS = [
   {
     id: 'onbit',
     name: 'Bonsai 27B 1-bit',
-    note: 'Q1_0 · 3.54 GB · 最省显存,上游原生支持最稳',
-    file: MODELS_DIR + 'Bonsai-27B-Q1_0.gguf',
+    note: 'Q1_0 · 3.54 GB · 已归档 F 盘(上游原生支持最稳)',
+    file: ARCHIVE_DIR + 'Bonsai-27B-Q1_0.gguf',
     bin: BIN.stock,
     defaultPreset: 'text-64k',
     // 本机实测:192K 仍满速(7809 MiB / 41.3 tok/s),224K 静默溢出。
@@ -254,8 +274,8 @@ const MODELS = [
   {
     id: 'ternary',
     name: 'Bonsai 2 27B 三元版',
-    note: 'PTQ1_0 · 5.54 GB · 质量保留 98.2%(须配官方构建)',
-    file: MODELS_DIR + 'Ternary-Bonsai-2-27B-PTQ1_0.gguf',
+    note: 'PTQ1_0 · 5.54 GB · 已归档 F 盘(须配官方构建)',
+    file: ARCHIVE_DIR + 'Ternary-Bonsai-2-27B-PTQ1_0.gguf',
     bin: BIN.prism,
     defaultPreset: 'text-64k',
     // 本机实测:q4_0 时 96K 满速(7869 MiB / 30-32 tok/s),128K 溢出(4.8 tok/s);
@@ -284,8 +304,8 @@ const MODELS = [
   {
     id: 'ternary-abliterated',
     name: '三元版 · 去审查(Abliterated)',
-    note: 'PTQ1_0 · 5.54 GB · 实测零拒答',
-    file: MODELS_DIR + 'Ternary-Bonsai-2-27B-Abliterated-PTQ1_0.gguf',
+    note: 'PTQ1_0 · 5.54 GB · 已归档 F 盘(实测零拒答)',
+    file: ARCHIVE_DIR + 'Ternary-Bonsai-2-27B-Abliterated-PTQ1_0.gguf',
     bin: BIN.prism,
     defaultPreset: 'text-64k',
     // 本机实测:q4_0 时 96K 满速(7869 MiB / 30-32 tok/s),128K 溢出(4.8 tok/s);
@@ -298,6 +318,108 @@ const MODELS = [
   },
 
 
+  // ------------------------------------------------------ 35B-A3B 无审查版(2026-09-29 新增)
+  //
+  // 两个都是 IsValorum 的 APEX-I-MiniPlus V2.1 Abliterated(heretic 定向消融),
+  // 3.40 bpw 混合精度、14.66 GB。选它的理由**不是**那个"Q6_K 档"标签 ——
+  // 经查证那是噪声加一处笔误(表格里 5.3952 与 ΔPPL +0.0552 自相矛盾,
+  // 且两版差异 0.027 只有误差棒 ±0.12 的 1/5)。成立的是三条硬事实:
+  //   1) 结构:路由 gate 保持 F32、输出头 Q6_K、共享专家 Q5_K、注意力门 Q8_0
+  //   2) 3.40 bpw 相对本机在用的 1.58 bpw 三值版是质变
+  //   3) 作者是按"从系统内存流式推理"专门配的量化配方
+  //
+  // ⚠ 这两个**必须**给 --n-cpu-moe:权重 14.66 GB 而显存只有 8 GB。
+  //   把 MoE 专家权重留在内存、注意力与共享专家放显存,才既跑得动又不慢。
+  //   档位靠实测扫描确定 —— 按本项目的规矩,没量过就不写死。
+  //
+  // ⚠ 采样用官方推荐的 0.6,别沿用小模型那套 0.7;官方明确禁止 greedy(长生成会复读)。
+  //
+  // ⚠ 底座差异(这就是两个都要留的原因):
+  //   qwen36-abl        底座是 Qwen3.6-35B-A3B **本体**,无长生成退化记录;
+  //   qwen38distill-abl 底座是 empero-ai 从 Qwen3.8 蒸馏的 Distill。官方模型卡自述
+  //     "长输出/长上下文相对 base 可能退化"(学生只在 8192 token 样本上训过),
+  //     且上游承认长生成会复读;修复版 V2 截至 2026-09-29 仍无任何公开踪影。
+  {
+    id: 'qwen36-abl',
+    name: 'Qwen3.6-35B-A3B · 去审查',
+    note: '3.40bpw · 14.66GB · 需 --n-cpu-moe 分流(档位待实测)',
+    file: 'D:\\Qwen3.6-35B-A3B-Abl\\Qwen3.6-35B-A3B.APEX-I-MiniPlus-V2.1-Abliterated.gguf',
+    bin: BIN.stock,
+    mmproj: 'D:\\Qwen3.6-35B-A3B-Abl\\mmproj-Q8_0.gguf',
+    kvLayers: { total: 40, withKv: 10 },
+    temp: 0.6,
+    // ---- 以下全是本机实测值(2026-09-29, RTX 5060 Laptop 8GB + 单通道 DDR5-5600) ----
+    //
+    // --n-cpu-moe 扫描(与 3.8-Distill **完全一致**):
+    //   40→2022 MiB/27.4   36→3342/30.3   32→4662/35.2   28→5910/35.4
+    //   24→7086/**40.3**   20→7788/**8.9** ← 静默溢出,止损规则命中
+    //   注意 24→20 时显存只涨 702 MiB(前几档每档约 1300),增速骤降正是溢出的指纹。
+    // 2026-09-30 交错对照(各 3 次,ABABAB 抵消系统漂移)把 23 与 24 分开了:
+    //   24 → 31.6 / 35.0 / 36.6(平均 34.4)   23 → 41.5 / 41.9 / 38.8(平均 40.7)
+    //   两档区间**完全不重叠**(23 的最低 38.8 > 24 的最高 36.6)=> +18%,不是噪声。
+    //   代价只有 +294 MiB 显存(6994→7288),离实测天花板 ~7869 还有 580 MiB 余量。
+    //   22 档(7580 MiB)反而掉到 34.9 —— 再往下就开始贴天花板,23 是局部最优。
+    //
+    // 线程数用同一套交错对照(在 23 档下,各 2 次):
+    //   20 → 41.0 / 34.3(平均 37.6,**极不稳定**)   12 → 42.3 / 44.0(平均 43.1,最稳)
+    //    8 → 39.6 / 38.0(平均 38.8)
+    // 12 最快且最可预测,还把 CPU 占用从"20 核满载"降下来 —— 直接缓解
+    // "CPU 满载 90°C"那个问题。显存不受线程数影响(三档都 7288 MiB)。
+    extraArgs: ['--n-cpu-moe', '23', '-t', '12'],
+    defaultPreset: 'text-64k',
+    //
+    // 上下文上限:
+    //   q4_0 → 192K 满速(**四次独立测量** 34.5/38.2/38.4/40.1),224K 稳定溢出(9.0-9.2)。
+    //          边界双向确认,所以给 196608 而不是更激进的值。
+    //   q8_0 → 64K 健康(三次 36.3/38.2),96K 出现一次请求失败(边界不稳),128K 溢出。
+    //          保守给 65536:这是唯一在多次测量里都稳的档。
+    //   maxCtx 保留 262144(模型原生上限):超过 safeCtx 时界面会给 ⚠ 并说明后果,
+    //   刻意超限仍是用户的选择 —— 与 Bonsai 系的处理方式一致。
+    // ⚠️ 2026-09-30 重要修正:**safeCtx 与 --n-cpu-moe 强耦合,改 ncm 必须重测!**
+    //   上面那个 196608(192K)是在 ncm **24** 下测的(7758 MiB,健康)。改成 ncm 23
+    //   后每 token 多占约 294 MiB 显存,192K 直接越过天花板(约 7869 MiB):
+    //   实测显存 7850/8151 MiB(只剩 301 MiB)、聊天掉到 7-16 t/s —— 而且是
+    //   **服务级**的静默溢出,连"1+1 等于几"都跟着慢。
+    //   当天用户实测:**160K + 视觉投影器**下 47.6 t/s 健康 → 采用 163840。
+    //   重测(2026-09-30,ncm 23,机器空闲,单次测量):
+    //     q4_0 → 128K 44.7 t/s / **160K 35.9 健康** / 192K **9.4 溢出**  => 163840
+    //     q8_0 → 32K 34.8 / 48K 42.5 / **64K 35.7 全部健康**              => 65536
+    //   q8_0 那个 32768 是我在没实测时的保守推算,**重测证明没必要** —— 64K 依然安全。
+    //   但注意 64K 时离天花板只剩约 85 MiB 余量(7784 MiB),属于"能用但不宽裕";
+    //   想更稳可以用 48K(7634 MiB,多 150 MiB 余量)。
+    safeCtx: { q4_0: 163840, q8_0: 65536 },
+    maxCtx: 262144,
+    // 启动探针基线。2026-09-30 直接用**探针本身**在 160K 下实测 51.3 t/s(ncm 23 / -t 12),
+    //   所以基线定到 50:判定线 = 50 × 0.6 = 30。
+    //   定高一点的意义:溢出会掉到 9 左右(必抓),而"部分溢出"掉到 30-40 这种
+    //   以前基线 40 时会漏判的档,现在也能抓到。
+    probeTps: 50,
+  },
+  {
+    id: 'qwen38distill-abl',
+    name: 'Qwen3.8-Distill-35B-A3B · 去审查',
+    note: '3.40bpw · 14.66GB · 蒸馏版,长输出有已知退化',
+    file: 'D:\\Qwen3.8-35B-A3B-Distill-Abl\\Qwen3.8-35B-A3B-Distill.APEX-I-MiniPlus-V2.1-Abliterated.gguf',
+    bin: BIN.stock,
+    mmproj: 'D:\\Qwen3.8-35B-A3B-Distill-Abl\\mmproj-Q8_0.gguf',
+    kvLayers: { total: 40, withKv: 10 },
+    temp: 0.6,
+    // ---- 实测值同 3.6 版(两个模型几何完全相同,扫描结果逐档一致) ----
+    //   唯一差异:A/B 实测 3.8 的正文更短(14,669 字/333 行 vs 16,143/534),
+    //   但速度、显存、上下文边界都相同。
+    //   --n-cpu-moe 23 与 -t 12 均由交错对照定出(数据见 3.6 条目);两模型几何相同故共用。
+    extraArgs: ['--n-cpu-moe', '23', '-t', '12'],
+    defaultPreset: 'text-64k',
+    //   同上:**safeCtx 随 --n-cpu-moe 变**。192K 是 ncm 24 时的值,ncm 23 下实测溢出
+    //   (本次复现:196608 → 7800 MiB / **9.4 t/s**)。160K 健康(用户实测 47.6 t/s)。
+    //   q8_0 重测后确认仍是 64K,完整数据见 3.6 条目。
+    safeCtx: { q4_0: 163840, q8_0: 65536 },
+    maxCtx: 262144,
+    // 探针基线 50:与 3.6 同(探针在 160K 下实测 51.3 t/s,详见 3.6 条目注释)
+    probeTps: 50,
+  },
+
+
   // 【警告】不要给 Bonsai 2(PTQ1_0)添加任何「更快的构建」条目。
   // 社区 fork(sudoingX/llama.cpp 的 pr-ptq1-mmv,即 BIN.fast / llama-cpp-mmq)虽然
   // 加载只要 2.5 秒(官方构建要 19 秒)、预填充还快一倍,但对 Bonsai 2 会【稳定塌缩】:
@@ -306,6 +428,24 @@ const MODELS = [
   // 那 19 秒加载是官方构建为 Hadamard 激活变换付出的代价,没有捷径。
   // BIN.fast 保留仅供参考,不要挂到任何三元模型上。
 ];
+
+// ---------------------------------------------------------------- 混合注意力的层数
+//
+// 给每个模型补上"多少层里有多少层带 KV cache"。界面用它生成
+// "为什么上下文便宜"的解释文案。
+//
+// 为什么必须有这个字段:那段文案原来把层数**写死**成"64 层里只有 16 层带 KV cache",
+// 加了 Qwen3.6/3.8-35B-A3B 之后就成了**事实错误**。
+// 数字来源:
+//   Bonsai 系(qwen35 混合注意力):block_count = 64,full_attention_interval = 4 → 16 层;
+//   Qwen3.6-35B-A3B 系 MoE:40 层里 10 层完整注意力,其余是 DeltaNet 线性注意力
+//     (见 IsValorum 模型卡的 tensor map 与实测量化说明)。
+//
+// 默认给 Bonsai 的值,因为那 4 个是历史条目;MoE 那两个在自己的条目里显式写了 kvLayers。
+const KV_LAYERS_DEFAULT = { total: 64, withKv: 16 };
+for (const m of MODELS) {
+  if (!m.kvLayers) m.kvLayers = KV_LAYERS_DEFAULT;
+}
 
 /**
  * 为「模型 + 预设」拼出 llama-server 的命令行。
@@ -350,6 +490,15 @@ const MODELS = [
  * overrides 是可选覆盖项(第 8 个位置参数,本身就是个对象,方便以后扩展):
  *   overrides.ctx  上下文 token 数,见上
  *   overrides.kv   KV cache 精度键名('q4_0' / 'q8_0'),非法值回落到默认
+ *
+ * 另有三个**可选 per-model 字段**,不写就完全保持原行为(为 35B-A3B 那两个加的):
+ *   model.mmproj    该模型自己的视觉投影器;留空用全局 MMPROJ
+ *                   (两个 Qwen 仓库都发了一个叫 mmproj-Q8_0.gguf 的文件,
+ *                    同名不同内容,所以必须 per-model,不能共用全局那个)
+ *   model.temp / model.topP / model.topK
+ *                   该模型自己的采样参数;留空用 0.7 / 0.95 / 20。
+ *                   Qwen 系列官方推荐 0.6 / 0.95 / 20,且明确禁止 greedy。
+ *   model.extraArgs 追加到命令行的参数数组,例如 ['--n-cpu-moe', '32']
  */
 function buildArgs(model, presetKey, port, reasoningKey, lanMode, apiKey, budgetKey, overrides) {
   const preset = PRESETS[presetKey];
@@ -367,9 +516,18 @@ function buildArgs(model, presetKey, port, reasoningKey, lanMode, apiKey, budget
   // 滑块传来的上下文。吸附到合法档位并夹在模型上限内 —— 这一层是必须的,
   // 不能让界面直接决定 `-c`,否则一次误拖就是静默溢出(见上面 VRAM_CEILING_MIB)。
   // 留空则用预设自带的 ctx,保持原有行为不变。
+  //
+  // ⚠ 2026-09-29 新增:预设来源的 ctx 还要**夹到该 KV 精度下的实测安全上限**。
+  //   原因:预设里的 ctx 是固定数字,而 safeCtx 随 KV 精度变 ——
+  //   "长文本 64K" 预设 + q8_0(三值模型实测安全上限只有 49152)会直接落在溢出区,
+  //   表现是静默慢 6-8 倍(见 config.js 顶部的实测记录)。
+  //   注意**只夹预设来源**的值:滑块传进来的具体数字是用户显式选择,
+  //   界面已经给了 ⚠ 和解释,不该被这里悄悄改掉。
+  const safeNow = safeCtxFor(model, kv);
+  const safePresetCtx = (safeNow && preset.ctx > safeNow) ? safeNow : preset.ctx;
   const ctx = ctxOverride === null || ctxOverride === undefined || ctxOverride === ''
-    ? preset.ctx
-    : (snapCtx(ctxOverride, model) || preset.ctx);
+    ? safePresetCtx
+    : (snapCtx(ctxOverride, model) || safePresetCtx);
 
   const args = [
     '-m', model.file,
@@ -384,9 +542,10 @@ function buildArgs(model, presetKey, port, reasoningKey, lanMode, apiKey, budget
     // 官方 model card 明确给出思考模式下的推荐采样,且实测报告的分数都基于这组值:
     //   Temperature 0.7 / Top-p 0.95 / Top-k 20
     // 这里原来是 temp 1.0 —— 偏高,会放大低比特模型的采样噪声。
-    '--temp', '0.7',
-    '--top-p', '0.95',
-    '--top-k', '20',
+    // 可用 model.temp/topP/topK 逐模型覆盖(如 Qwen 官方要 0.6)。
+    '--temp', String(model.temp ?? 0.7),
+    '--top-p', String(model.topP ?? 0.95),
+    '--top-k', String(model.topK ?? 20),
     '--host', lanMode ? '0.0.0.0' : '127.0.0.1',
     '--port', String(port),
   ];
@@ -417,7 +576,13 @@ function buildArgs(model, presetKey, port, reasoningKey, lanMode, apiKey, budget
   if (apiKey) args.push('--api-key', apiKey);
 
   if (preset.vision) {
-    args.push('--mmproj', MMPROJ, '--no-mmproj-offload', '--image-max-tokens', '1024');
+    // per-model 投影器优先;没写才回落到全局那个(现有 Bonsai 系列走这条)
+    args.push('--mmproj', model.mmproj || MMPROJ, '--no-mmproj-offload', '--image-max-tokens', '1024');
+  }
+
+  // 逐模型追加参数(如 --n-cpu-moe)。放最后,便于覆盖前面的默认值。
+  if (Array.isArray(model.extraArgs) && model.extraArgs.length) {
+    args.push(...model.extraArgs);
   }
   return args;
 }
