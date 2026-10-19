@@ -240,7 +240,13 @@ function parseDotNetDate(text) {
 
 const START_TIME_TOLERANCE_MS = 30_000;
 
-/** 台账项：{ pid, startedAt, exe, argvHash, port, generation } */
+/**
+ * 台账项：{ pid, startedAt, exe, argvHash, port, generation, modelId, preset, lanMode }
+ *
+ * modelId/preset/lanMode 是 P3 热接管新增的：外壳重启后 /health 只能证明
+ * “端口上有个活着的服务”，模型是谁、用什么预设、是不是 LAN 模式只能靠台账
+ * 记住 —— 否则接管回来界面只能显示一个空壳。
+ */
 function makeLedgerEntry(fields) {
   return {
     pid: Number(fields.pid),
@@ -249,6 +255,9 @@ function makeLedgerEntry(fields) {
     argvHash: fields.argvHash || null,
     port: Number(fields.port) || null,
     generation: Number(fields.generation) || null,
+    modelId: fields.modelId == null ? null : String(fields.modelId),
+    preset: fields.preset == null ? null : String(fields.preset),
+    lanMode: !!fields.lanMode,
   };
 }
 

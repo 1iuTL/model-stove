@@ -392,6 +392,165 @@ test('start：日志文件名带启动时刻，每次启动独立', async () => 
   );
 });
 
+// ---------------------------------------------------------------- 热接管（P3）
+
+/** 一条可被接管的台账（启动时间可传 null 模拟旧格式）。 */
+const adoptEntry = (extra = {}) => ({
+  pid: 7101,
+  startedAt: 5000,
+  exe: EXE,
+  argvHash: 'abc123',
+  port: 8234,
+  generation: 1,
+  modelId: 'onbit',
+  preset: 'text-32k',
+  lanMode: false,
+  ...extra,
+});
+
+test('tryAdopt：台账里有健康实例 → 认领为 ready，端口/模型正确', async () => {
+  const sup = makeSup({
+    pidAlive: () => true,
+    processStartTime: () => 5000,
+    healthCheck: async () => true,
+  });
+  ports.writeLedger(sup.ledgerFile, [adoptEntry()]);
+
+  const res = await sup.tryAdopt();
+  assert.equal(res.adopted, true);
+  assert.equal(res.identity, 'strong');
+  assert.equal(sup.state, STATE.READY);
+
+  const st = sup.status();
+  assert.equal(st.adopted, true);
+  assert.equal(st.identity, 'strong');
+  assert.equal(st.pid, 7101);
+  assert.equal(st.port, 8234);
+  assert.equal(st.url, 'http://127.0.0.1:8234/');
+  assert.equal(st.modelId, 'onbit');
+  assert.equal(st.preset, 'text-32k');
+  assert.equal(sup.lastPort, 8234);
+  assert.equal(sup.handle.logFile, null, '接管不应伪造日志文件');
+
+  // 台账保留，并回写 modelId/preset/lanMode，供下次外壳重启继续认。
+  const ledger = ports.readLedger(sup.ledgerFile);
+  assert.equal(ledger.length, 1);
+  assert.equal(ledger[0].pid, 7101);
+  assert.equal(ledger[0].modelId, 'onbit');
+  assert.equal(ledger[0].preset, 'text-32k');
+  assert.equal(ledger[0].lanMode, false);
+  assert.equal(ledger[0].port, 8234);
+});
+
+test('tryAdopt：旧台账没有启动时间 → weak 身份也允许认领', async () => {
+  const sup = makeSup({
+    pidAlive: () => true,
+    healthCheck: async () => true,
+  });
+  ports.writeLedger(sup.ledgerFile, [adoptEntry({ startedAt: null })]);
+
+  const res = await sup.tryAdopt();
+  assert.equal(res.adopted, true);
+  assert.equal(res.identity, 'weak');
+  assert.equal(sup.status().identity, 'weak');
+  assert.equal(sup.status().state, STATE.READY);
+  assert.ok(sup.status().startedAt > 0, '没有台账启动时间时应回落到 now()');
+  // 台账里仍必须是 null —— 写 now() 会让下次身份核对误判成 PID 复用。
+  assert.equal(ports.readLedger(sup.ledgerFile)[0].startedAt, null);
+});
+
+test('tryAdopt：健康检查失败 → 不认领、不杀进程、台账不变', async () => {
+  const killed = [];
+  let healthCalls = 0;
+  const sup = makeSup({
+    pidAlive: () => true,
+    processStartTime: () => 5000,
+    healthCheck: async () => { healthCalls++; return false; },
+    killProcess: (pid) => killed.push(pid),
+  });
+  ports.writeLedger(sup.ledgerFile, [adoptEntry()]);
+  const before = fs.readFileSync(sup.ledgerFile, 'utf8');
+
+  const res = await sup.tryAdopt({ timeoutMs: 400 });
+  assert.equal(res.adopted, false);
+  assert.equal(res.reason, 'no-healthy-leftover');
+  assert.deepEqual(killed, []);
+  assert.equal(sup.state, STATE.IDLE);
+  assert.equal(healthCalls, 2, '最多尝试 2 次');
+  assert.equal(fs.readFileSync(sup.ledgerFile, 'utf8'), before, '台账必须原样保留');
+});
+
+test('tryAdopt：PID 启动时间对不上（PID 被复用）→ 不认领', async () => {
+  const killed = [];
+  let healthCalls = 0;
+  const sup = makeSup({
+    pidAlive: () => true,
+    processStartTime: () => 999999,
+    healthCheck: async () => { healthCalls++; return true; },
+    killProcess: (pid) => killed.push(pid),
+  });
+  ports.writeLedger(sup.ledgerFile, [adoptEntry()]);
+
+  const res = await sup.tryAdopt();
+  assert.equal(res.adopted, false);
+  assert.equal(res.reason, 'no-healthy-leftover');
+  assert.equal(healthCalls, 0, '身份不符时不该做健康检查');
+  assert.deepEqual(killed, []);
+  assert.deepEqual(ports.readLedger(sup.ledgerFile).map((e) => e.pid), [7101]);
+});
+
+test('tryAdopt：端口非法 → 跳过，不做健康检查', async () => {
+  let healthCalls = 0;
+  const sup = makeSup({
+    pidAlive: () => true,
+    processStartTime: () => 5000,
+    healthCheck: async () => { healthCalls++; return true; },
+  });
+  ports.writeLedger(sup.ledgerFile, [adoptEntry({ port: 70000 })]);
+
+  const res = await sup.tryAdopt();
+  assert.equal(res.adopted, false);
+  assert.equal(healthCalls, 0);
+});
+
+test('tryAdopt：busy 状态直接拒绝', async () => {
+  const fake = fakeSpawn();
+  const sup = makeSup({ spawn: fake.spawn });
+  await sup.start(basicParams());
+  const res = await sup.tryAdopt();
+  assert.deepEqual(res, { adopted: false, reason: 'busy' });
+  assert.equal(sup.status().adopted, false, '原有 handle 不能被替换');
+  assert.equal(sup.status().pid, 9001);
+});
+
+test('tryAdopt 之后 stop：kill 被接管的 PID、清台账、回到 idle', async () => {
+  const alive = new Set([7101]);
+  const signals = [];
+  const sup = makeSup({
+    pidAlive: (pid) => alive.has(pid),
+    processStartTime: () => 5000,
+    healthCheck: async () => true,
+    killProcess: (pid, signal) => {
+      signals.push(signal || 'SIGTERM');
+      alive.delete(pid);
+    },
+  });
+  ports.writeLedger(sup.ledgerFile, [adoptEntry()]);
+
+  const adopted = await sup.tryAdopt();
+  assert.equal(adopted.adopted, true);
+
+  const res = await sup.stop();
+  assert.deepEqual(res.stopped, [7101]);
+  assert.equal(res.adopted, false);
+  assert.equal(res.dead, true);
+  assert.deepEqual(signals, ['SIGTERM']);
+  assert.equal(sup.status().state, STATE.IDLE);
+  assert.equal(sup.status().adopted, false);
+  assert.equal(sup.handle, null);
+  assert.deepEqual(ports.readLedger(sup.ledgerFile), []);
+});
+
 // ---------------------------------------------------------------- 工具函数
 
 test('defaultMaskArgs：只遮 --api-key 的值', () => {

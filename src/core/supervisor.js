@@ -124,6 +124,11 @@ class Supervisor extends EventEmitter {
       uptimeMs: h ? Math.max(0, this.now() - h.startedAt) : 0,
       generation: h ? h.generation : null,
       argvHash: h ? h.argvHash : null,
+      lanMode: h ? !!h.lanMode : false,
+      // P3 热接管：adopted 表示这个 handle 不是本轮 spawn 的，而是从台账认领的；
+      // identity 只有认领来的才有值（strong = 启动时间吻合，weak = 旧台账没有启动时间）。
+      adopted: h ? !!h.adopted : false,
+      identity: h && h.identity ? h.identity : null,
     };
   }
 
@@ -156,7 +161,7 @@ class Supervisor extends EventEmitter {
    * 成功返回 status()；失败抛 Error（附 code/signal/logTail）。
    */
   async start(params = {}) {
-    const { exe, argsForPort, modelId = null, preset = null } = params;
+    const { exe, argsForPort, modelId = null, preset = null, lanMode = false } = params;
     const readyTimeoutMs = params.readyTimeoutMs == null ? this.readyTimeoutMs : params.readyTimeoutMs;
 
     if (!exe) throw new Error('start 需要 exe');
@@ -231,6 +236,9 @@ class Supervisor extends EventEmitter {
         url: `http://127.0.0.1:${port}/`,
         modelId,
         preset,
+        // P3：LAN 模式也要进台账 —— 热接管后 main.js 要按它恢复 current。
+        lanMode: !!lanMode,
+        adopted: false,
       });
       this.handle = handle;
       this.child = child;
@@ -262,6 +270,210 @@ class Supervisor extends EventEmitter {
       await this._abortStart();
       throw err;
     }
+  }
+
+  // -------------------------------------------------------------- 热接管（P3）
+
+  /**
+   * 尝试热接管上一轮外壳留下的 llama-server。
+   *
+   * 背景：外壳重启（正常退出前的 keepServerOnClose，或崩溃后重开）时，
+   * llama-server 可能还活着。旧逻辑是 start() 里先 cleanupLeftovers() 把它
+   * 杀掉，用户得重新等十几秒加载。这里在启动链最前面认领它：
+   *   - 只认台账里 PID/启动时间核对得上的（旧台账无启动时间 → weak，允许认）；
+   *   - 端口必须合法（1..65535）；
+   *   - /health 必须正常（复用注入的 healthCheck，最多 2 次、总预算 timeoutMs）。
+   *
+   * 任何一项不满足都**不动**该进程、也不清台账 —— 清理仍归 cleanupLeftovers()。
+   * 整个函数不抛异常：热接管失败绝不能阻断外壳启动。
+   *
+   * 参数：
+   *   healthCheck  健康检查 (handle, timeoutMs) => Promise<boolean>
+   *   timeoutMs    健康检查 + 重试的总预算（默认 2000ms）
+   *   propsCheck   可选的二次校验（例如 /props）；返回 falsy 则放弃该实例
+   *
+   * 返回：
+   *   { adopted: true, status, identity }
+   *   { adopted: false, reason: 'busy' | 'no-healthy-leftover' | 'error' }
+   */
+  async tryAdopt(options = {}) {
+    const {
+      healthCheck = this.healthCheck,
+      timeoutMs = 2000,
+      propsCheck = null,
+    } = options || {};
+
+    try {
+      // 只有完全空闲时才认领：starting/ready/stopping/error 都有明确归属，
+      // 此时接管会覆盖现有 handle，属于状态机事故。
+      if (this.state !== STATE.IDLE || this.handle) {
+        return { adopted: false, reason: 'busy' };
+      }
+      if (!this.ledgerFile) return { adopted: false, reason: 'no-healthy-leftover' };
+
+      const entries = this.readLedger(this.ledgerFile);
+      if (!Array.isArray(entries) || !entries.length) {
+        return { adopted: false, reason: 'no-healthy-leftover' };
+      }
+
+      const budget = Math.max(0, Number(timeoutMs) || 0);
+      for (const entry of entries) {
+        const candidate = this._adoptionCandidate(entry);
+        if (!candidate) continue;
+
+        // PID 身份：有启动时间的必须吻合（防 PID 复用误认）；旧格式没有启动时间
+        // 只能退化成 weak —— 允许认领，但在 identity 里如实标出来。
+        const check = this.checkLedgerEntry(entry, {
+          startTimeReader: this.processStartTime,
+          alive: this.pidAlive,
+        });
+        if (!check || !check.alive || !check.same) continue;
+
+        const healthy = await this._adoptionHealthy(candidate, healthCheck, budget);
+        if (!healthy) continue;
+
+        if (typeof propsCheck === 'function') {
+          let propsOk = false;
+          try {
+            propsOk = await propsCheck(candidate);
+          } catch {
+            propsOk = false;
+          }
+          if (!propsOk) continue;
+        }
+
+        // 全部通过：构造 adopted 句柄（不可变，和 spawn 出来的 handle 同一形状）。
+        // adopted 的进程没有 child，所以 exit 事件不会误伤它；stop() 仍按 PID 收。
+        const generation = ++this.generation;
+        const startedAt = Number(entry.startedAt) > 0 ? Number(entry.startedAt) : this.now();
+        const identity = entry.startedAt ? 'strong' : 'weak';
+        const handle = Object.freeze({
+          pid: entry.pid,
+          startedAt,
+          exe: entry.exe || null,
+          argvHash: entry.argvHash || null,
+          port: candidate.port,
+          generation,
+          logFile: null,
+          logOffset: 0,
+          url: candidate.url,
+          modelId: entry.modelId || null,
+          preset: entry.preset || null,
+          lanMode: !!entry.lanMode,
+          adopted: true,
+          identity,
+        });
+
+        this.handle = handle;
+        this.child = null;
+        this.lastPort = candidate.port;
+        this._failStart = null;
+        // 台账保留并回写一次：带上 modelId/preset/lanMode，下次外壳重启还能认出来。
+        // 注意弱身份（旧台账无启动时间）必须继续记 null，见 _writeAdoptedLedger。
+        this._writeAdoptedLedger(entry);
+        this._setState(STATE.READY);
+        return { adopted: true, status: this.status(), identity };
+      }
+
+      return { adopted: false, reason: 'no-healthy-leftover' };
+    } catch (e) {
+      // 接管是"锦上添花"：任何异常都吞掉，让外壳照常走冷启动路径。
+      return {
+        adopted: false,
+        reason: 'error',
+        error: e && e.message ? e.message : String(e),
+      };
+    }
+  }
+
+  /**
+   * 接管成功后的台账回写。
+   *
+   * 句柄的 startedAt 在弱身份时会填 now()（仅用于界面 uptime），但台账必须
+   * **保留原始的 null**：写 now() 会让下次外壳启动拿一个错误的启动时间做身份
+   * 核对，把活着的服务误判成 "pid-reused"，既不接管也不收尸。
+   */
+  _writeAdoptedLedger(entry) {
+    if (!this.ledgerFile) return;
+    try {
+      const h = this.handle;
+      this.writeLedger(this.ledgerFile, [{
+        ...(h || {}),
+        pid: (h && h.pid) || (entry && entry.pid),
+        startedAt: entry && entry.startedAt ? entry.startedAt : null,
+        modelId: (h && h.modelId) || (entry && entry.modelId) || null,
+        preset: (h && h.preset) || (entry && entry.preset) || null,
+        lanMode: !!(h && h.lanMode),
+      }]);
+    } catch { /* 台账写不了不该阻断接管 */ }
+  }
+
+  /** 校验台账项能否作为接管候选：PID 合法、端口在 1..65535。 */
+  _adoptionCandidate(entry) {    if (!entry || !Number.isInteger(entry.pid) || entry.pid <= 0) return null;
+    const port = Number(entry.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+    return { pid: entry.pid, port, url: `http://127.0.0.1:${port}/` };
+  }
+
+  /**
+   * /health 探测：最多 2 次，总耗时不超过 timeoutMs。
+   *
+   * 用两套截止时间：this.now()（可注入，便于单测）与真实 Date.now()。
+   * 后者保证即使注入的是冻结时钟，也不会把外壳启动拖过预算。
+   */
+  async _adoptionHealthy(candidate, healthCheck, timeoutMs) {
+    const hardDeadline = Date.now() + Math.max(0, timeoutMs);
+    const softDeadline = this.now() + Math.max(0, timeoutMs);
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const remaining = Math.min(hardDeadline - Date.now(), softDeadline - this.now());
+      if (remaining <= 0) return false;
+
+      let ok = false;
+      try {
+        ok = await this._raceTimeout(
+          Promise.resolve().then(() => healthCheck(candidate, Math.max(1, Math.floor(remaining)))),
+          remaining,
+        );
+      } catch {
+        ok = false;
+      }
+      if (ok) return true;
+
+      if (attempt === 0) {
+        const left = Math.min(hardDeadline - Date.now(), softDeadline - this.now());
+        if (left <= 0) return false;
+        await this.sleep(Math.min(150, Math.max(1, left)));
+      }
+    }
+    return false;
+  }
+
+  /** 给一个 Promise 套上超时；超时按 false 处理（不 reject，方便走重试）。 */
+  _raceTimeout(promise, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        resolve(false);
+      }, Math.max(1, timeoutMs));
+      if (timer && typeof timer.unref === 'function') timer.unref();
+      promise.then(
+        (v) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(v);
+        },
+        (e) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(e);
+        },
+      );
+    });
   }
 
   async _waitSpawnError(child) {
