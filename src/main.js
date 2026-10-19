@@ -8,7 +8,7 @@
 //   5. 停止 / 切换 / 退出时把子进程收干净
 //
 // 聊天界面本身来自 llama.cpp;这个外壳只负责管理它。
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage } = require('electron');
 const { spawn, execFileSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
@@ -34,6 +34,15 @@ const PROXY_SCRIPT = path.join(REPO_ROOT, 'context-proxy.mjs');
 const DEFAULT_SERVER_PORT = 8091;
 
 let win = null;
+// P3：真正退出（app.quit / 托盘「停止服务并退出」/ 设置要求关窗退出）时才置 true。
+// 关窗保活时窗口只是 hide()，绝不能因为 close 事件就把服务停掉。
+let quitting = false;
+// 托盘句柄与"托盘不可用"标记。测试桩里没有 Tray，第一次尝试失败后就退回旧行为，
+// 不反复抛错；真实环境里图标/菜单创建失败也只影响关窗保活，不影响服务本身。
+let tray = null;
+let trayUnavailable = false;
+// 退出前清理只做一次（window-all-closed 与 tray 点击都会走到这里）。
+let shutdownPromise = null;
 // 未运行时的状态。收成一个常量,免得三处各写一份、改漏一处。
 const EMPTY_CURRENT = { modelId: null, preset: null, reasoning: null, budget: null, ctx: null, kv: null, speed: null, lanMode: false, startedAt: null };
 let current = { ...EMPTY_CURRENT };
@@ -152,7 +161,7 @@ function ensureSupervisor() {
 /** 当前服务状态的安全包装（未初始化时返回 idle）。 */
 function serviceStatus() {
   if (!supervisor) {
-    return { state: 'idle', modelId: null, preset: null, pid: null, port: null, url: null, startedAt: null, uptimeMs: 0, generation: null, argvHash: null };
+    return { state: 'idle', modelId: null, preset: null, pid: null, port: null, url: null, startedAt: null, uptimeMs: 0, generation: null, argvHash: null, lanMode: false, adopted: false, identity: null };
   }
   const st = supervisor.status();
   // Supervisor 在空闲态会保留 lastPort（停止时要用它认领外部监听者）；
@@ -699,6 +708,7 @@ async function startServer(modelId, presetKey, reasoningKey, lanMode, budgetKey,
       exe: model.bin,
       modelId,
       preset: presetKey,
+      lanMode: !!lanMode,
       argsForPort: (port) => {
         // 端口由 Supervisor 动态选出后再拼 argv；参数门控在 buildArgs 外面，
         // 不改变 buildArgs() 的语义（90 例快照仍是逐字节基准）。
@@ -746,6 +756,7 @@ async function startServer(modelId, presetKey, reasoningKey, lanMode, budgetKey,
           exe: model.bin,
           modelId,
           preset: presetKey,
+          lanMode: !!lanMode,
           argsForPort: (port) => {
             // 重试会拿到新端口，必须在**新端口**上重新生成 argv，
             // 不能直接复用 plan.args（里面是上一次的 --port）。
@@ -842,7 +853,118 @@ async function startServer(modelId, presetKey, reasoningKey, lanMode, budgetKey,
 // ------------------------------------------------------------------ 渲染层
 
 function notifyRenderer() {
-  if (win && !win.isDestroyed()) win.webContents.send('state-changed');
+  // 热接管发生在窗口创建前后都可能：win 还不存在、或正在销毁时都必须安全。
+  if (!win || win.isDestroyed()) return;
+  try {
+    if (win.webContents && typeof win.webContents.send === 'function') {
+      win.webContents.send('state-changed');
+    }
+  } catch { /* 窗口正在销毁，忽略 */ }
+}
+
+// ------------------------------------------------------------ 关窗保活 / 托盘（P3）
+//
+// 已定决策：关窗默认保留 llama-server（settings.keepServerOnClose，默认 true）。
+// 点关闭按钮 = 隐藏窗口到托盘；「停止服务并退出」才真的停服务。
+// 设置里显式写 false 时保持旧行为（关窗 = 停服务 + 退出）。
+// 托盘创建失败（老 Electron、测试桩、图标损坏）必须退回旧行为，不能留下
+// 一个无法唤回的隐藏窗口。
+
+/** 关窗是否保留服务。默认 true；任何读取失败也按 true（已定决策）。 */
+function keepServerOnClose() {
+  try {
+    // core/settings 会把缺失的键补成默认值；这里仍用 !== false，
+    // 兼容 settings 尚未初始化（返回 {}）或旧文件没有该键的情况。
+    return settings.readSettings().keepServerOnClose !== false;
+  } catch {
+    return true;
+  }
+}
+
+/** 显示/重建主窗口（托盘「打开窗口」与 app activate 共用）。 */
+function showWindow() {
+  if (!win || win.isDestroyed()) {
+    createWindow();
+    return;
+  }
+  try {
+    if (typeof win.isMinimized === 'function' && win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
+  } catch { /* 窗口正在销毁，忽略 */ }
+}
+
+/**
+ * 创建托盘（幂等）。成功返回 true；失败返回 false 并标记 trayUnavailable，
+ * 由关闭处理器退回旧行为（关窗即停服务退出）。
+ */
+function ensureTray() {
+  if (tray) return true;
+  if (trayUnavailable) return false;
+  try {
+    if (typeof Tray !== 'function' || !Menu || typeof Menu.buildFromTemplate !== 'function') {
+      throw new Error('当前 Electron 环境没有 Tray/Menu');
+    }
+    const iconPath = path.join(REPO_ROOT, 'icon-256.png');
+    let icon = iconPath;
+    try {
+      if (nativeImage && typeof nativeImage.createFromPath === 'function') {
+        const img = nativeImage.createFromPath(iconPath);
+        if (img && (typeof img.isEmpty !== 'function' || !img.isEmpty())) icon = img;
+      }
+    } catch { /* 图标读不出来就用路径，让 Tray 自己报错 */ }
+
+    tray = new Tray(icon);
+    const menu = Menu.buildFromTemplate([
+      { label: '打开窗口', click: () => showWindow() },
+      { type: 'separator' },
+      {
+        label: '停止服务并退出',
+        click: () => { stopServiceAndQuit(); },
+      },
+    ]);
+    if (typeof tray.setContextMenu === 'function') tray.setContextMenu(menu);
+    if (typeof tray.setToolTip === 'function') tray.setToolTip('Model Stove · 模型灶台');
+    if (typeof tray.on === 'function') tray.on('double-click', () => showWindow());
+    appendShellLog('[shell] 托盘已创建（关窗后服务继续运行）');
+    return true;
+  } catch (e) {
+    tray = null;
+    trayUnavailable = true;
+    appendShellLog(`[shell] 托盘创建失败，关窗退回旧行为（停止服务并退出）: ${e.message}`);
+    return false;
+  }
+}
+
+/** 停服务 + 停代理，整个退出流程只执行一次。 */
+function shutdownServices() {
+  if (!shutdownPromise) {
+    shutdownPromise = (async () => {
+      try {
+        await stopServer();
+      } catch (e) {
+        appendShellLog(`[shell] 退出前停止服务失败: ${e.message}`);
+      }
+      try {
+        await stopProxy();
+      } catch (e) {
+        appendShellLog(`[shell] 退出前停止代理失败: ${e.message}`);
+      }
+    })();
+  }
+  return shutdownPromise;
+}
+
+/** 托盘「停止服务并退出」：先收干净再 app.quit()。 */
+async function stopServiceAndQuit() {
+  if (quitting && shutdownPromise) return shutdownPromise;
+  quitting = true;
+  appendShellLog('[shell] 停止服务并退出');
+  await shutdownServices();
+  try { if (tray) tray.destroy(); } catch {}
+  tray = null;
+  app.quit();
+  return shutdownPromise;
 }
 
 /** 当前 llama-server 的源（scheme + host + port）；没有服务时为 null。 */
@@ -909,6 +1031,21 @@ function createWindow() {
     },
   });
   win.setMenuBarVisibility(false);
+
+  // P3 关窗保活：默认只隐藏到托盘，服务继续跑。只有真正退出（quitting）
+  // 或设置显式 keepServerOnClose=false 时才让窗口关闭。
+  win.on('close', (event) => {
+    if (quitting || !keepServerOnClose()) return;
+    if (!ensureTray()) {
+      // 托盘不可用就不能隐藏窗口 —— 没有入口能把它唤回来。退回旧行为：
+      // 允许关闭，由 window-all-closed 停服务并退出。
+      quitting = true;
+      appendShellLog('[shell] 托盘不可用，按旧行为关窗退出');
+      return;
+    }
+    event.preventDefault();
+    win.hide();
+  });
 
   // 附加一层 webview 属性收紧：即使渲染层以后又写回 preload/allowpopups，
   // 这里也会在挂载前把它们清掉。allowpopups 已经在 index.html 删除，
@@ -1010,6 +1147,9 @@ ipcMain.handle('settings:get', () => {
     // 启动速度探针的开关。默认开 —— 它是唯一能抓出"KV 溢出到内存"的手段,
     // 而那个故障是静默的。关掉只影响"要不要花几十秒探测",不影响使用。
     probe: s.probe !== false,
+    // P3：关窗是否保留服务（默认 true）。界面暂未消费，但先暴露给 IPC，
+    // 后续设置页开关不需要再改主进程契约。
+    keepServerOnClose: s.keepServerOnClose !== false,
     addresses: localAddresses(serviceStatus().port || configuredBasePort()),
   };
 });
@@ -1019,9 +1159,16 @@ ipcMain.handle('settings:set', (_e, patch) => {
   if (typeof patch?.apiKey === 'string') clean.apiKey = patch.apiKey.trim();
   if (typeof patch?.lanMode === 'boolean') clean.lanMode = patch.lanMode;
   if (typeof patch?.probe === 'boolean') clean.probe = patch.probe;
+  if (typeof patch?.keepServerOnClose === 'boolean') clean.keepServerOnClose = patch.keepServerOnClose;
   settings.writeSettings(clean);
   const s = settings.readSettings();
-  return { ok: true, apiKey: s.apiKey || '', lanMode: !!s.lanMode, probe: s.probe !== false };
+  return {
+    ok: true,
+    apiKey: s.apiKey || '',
+    lanMode: !!s.lanMode,
+    probe: s.probe !== false,
+    keepServerOnClose: s.keepServerOnClose !== false,
+  };
 });
 
 ipcMain.handle('settings:genkey', () => {
@@ -1747,21 +1894,72 @@ if (!gotTheLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    if (win) {
-      if (win.isMinimized()) win.restore();
-      win.show();
-      win.focus();
-    }
+    // 关窗保活后窗口可能只是隐藏（甚至没有窗口），showWindow() 两种都能处理。
+    showWindow();
   });
 }
 
+/**
+ * P3：启动时尝试热接管上一次外壳留下的 llama-server。
+ *
+ * 成功 → 不 spawn、不杀进程，直接把 current 恢复成"运行中"，界面立刻可用；
+ * 失败 → 保持未运行，等用户点启动（cleanupLeftovers() 仍会在 start() 里收尸）。
+ *
+ * ctx/kv/reasoning 只存在于旧外壳的 argv 里，从台账无法还原（也不该猜），
+ * 所以置 null 交给界面按模型/预设回落；modelId/preset/lanMode/startedAt
+ * 从 adopted status 恢复。
+ */
+async function adoptExistingServer(readyT0 = null) {
+  const t0 = Date.now();
+  let result;
+  try {
+    // 2 秒是上限；真实 /health 通常几十毫秒，验收目标是整体 ≤1s。
+    result = await ensureSupervisor().tryAdopt({ timeoutMs: 2000 });
+  } catch (e) {
+    result = { adopted: false, reason: 'error', error: e.message };
+  }
+  const adoptMs = Date.now() - t0;
+
+  if (!result || !result.adopted) {
+    appendShellLog(`[shell] 未发现可热接管的服务（${(result && result.reason) || 'unknown'}，探测 ${adoptMs}ms）`);
+    notifyRenderer();
+    return { ...(result || { adopted: false }), adoptMs };
+  }
+
+  const st = result.status || ensureSupervisor().status();
+  current = {
+    modelId: st.modelId || null,
+    preset: st.preset || null,
+    reasoning: null,
+    budget: null,
+    ctx: null,
+    kv: null,
+    speed: null,
+    lanMode: !!st.lanMode,
+    startedAt: st.startedAt || Date.now(),
+  };
+  const readyMs = Number.isFinite(readyT0) ? Date.now() - readyT0 : adoptMs;
+  appendShellLog(`[shell] 热接管已有服务 pid=${st.pid} port=${st.port} `
+    + `(model=${st.modelId || '未知'}, 用时 ${adoptMs}ms, 启动链 ${readyMs}ms)`);
+  notifyRenderer();
+  return { ...result, adoptMs, readyMs };
+}
+
 app.whenReady().then(async () => {
+  const readyT0 = Date.now();
   if (!gotTheLock) return;   // 第二个实例:不建窗口、不起服务,直接退出
   // 路径 / 设置文件 / Supervisor 都在这里定型：
   //   - dataDir 默认就是 userData（旧设置文件原位，自动迁移）；
   //   - logsDir 由 paths 决定，不再假设"仓库旁边有一个 logs"。
   initRuntime();
   createWindow();
+
+  // P3：先尝试热接管，再自动拉起代理 —— 这样代理启动时 desiredProxyTarget()
+  // 已经能拿到被接管服务的动态端口，不会先指回 8091。
+  await adoptExistingServer(readyT0);
+
+  // 关窗保活开启时提前建托盘（失败则关窗自动退回旧行为）。
+  if (keepServerOnClose()) ensureTray();
 
   // 上次外壳非正常退出可能留下代理进程。按台账收掉,免得它占着 8092
   // 导致这次"端口被占用"。—— 只杀我们自己记过的 PID,不碰你手动跑的。
@@ -1822,14 +2020,27 @@ async function autoStart(modelId, preset, reasoning, fourth) {
   }
 }
 
+app.on('activate', () => {
+  // 托盘/任务栏激活：窗口被隐藏到托盘或已销毁时都能唤回来。
+  if (!win || win.isDestroyed()) createWindow();
+  else showWindow();
+});
+
 app.on('window-all-closed', async () => {
-  await stopServer();
-  await stopProxy();
+  // 关窗保活：窗口只是 hide()，不会走到这里。真正到这里只有两种情况：
+  //   1) 正在退出（quitting）；
+  //   2) 设置显式 keepServerOnClose=false → 保持旧行为（停服务 + 退出）。
+  if (!quitting && keepServerOnClose()) return;
+  quitting = true;
+  await shutdownServices();
   app.quit();
 });
 
 // 确保子进程不会比外壳活得更久（退出流程不等待；完整收尸由 Supervisor 负责）。
 app.on('before-quit', () => {
+  quitting = true;
+  try { if (tray) tray.destroy(); } catch {}
+  tray = null;
   const st = serviceStatus();
   if (st.pid) { try { process.kill(st.pid); } catch {} }
   if (proxyChild) { try { process.kill(proxyChild.pid); } catch {} }
@@ -1872,4 +2083,10 @@ module.exports.__test = {
   catalog: () => catalogSummary(),
   refreshCatalog,
   runtimeModels,
+  // P3：热接管 / 关窗保活。测试用来读 current、触发认领与退出条件。
+  current: () => ({ ...current }),
+  adoptExistingServer: (readyT0) => adoptExistingServer(readyT0),
+  tryAdopt: (options) => ensureSupervisor().tryAdopt(options),
+  keepServerOnClose,
+  isQuitting: () => quitting,
 };
