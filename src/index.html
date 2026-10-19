@@ -1,0 +1,1532 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>Model Stove · 模型灶台 — 本地模型启动器</title>
+<style>
+  :root {
+    --bg: #14161a;
+    --panel: #1b1e24;
+    --panel-2: #22262e;
+    --line: #2d323c;
+    --text: #e6e8ec;
+    --dim: #8b93a1;
+    --accent: #4c8dff;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --err: #f85149;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex; background: var(--bg); color: var(--text);
+    font: 13px/1.5 "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
+    overflow: hidden;
+  }
+
+  /* ---------------------------------------------------------------- 侧栏 */
+  #side {
+    width: 320px; flex: 0 0 320px; display: flex; flex-direction: column;
+    background: var(--panel); border-right: 1px solid var(--line);
+  }
+  #side h1 {
+    font-size: 14px; margin: 0; padding: 14px 16px 12px;
+    border-bottom: 1px solid var(--line); font-weight: 600; letter-spacing: .3px;
+    display: flex; align-items: flex-start; gap: 8px;
+  }
+  #side h1 .titles { flex: 1; min-width: 0; }
+  #side h1 small { display: block; color: var(--dim); font-weight: 400; font-size: 11px; margin-top: 3px; }
+  #btnSettings {
+    flex: 0 0 auto; width: 26px; height: 26px; padding: 0; line-height: 1;
+    font-size: 14px; border-radius: 6px;
+  }
+  #btnSettings.on { border-color: var(--accent); background: #1e2734; }
+
+  #settings {
+    border-bottom: 1px solid var(--line); background: #171a1f;
+    /* 设置面板内容较多,给它一个上限并自己滚动。
+       否则打开设置时,底部的「启动」按钮会被挤出可视区域 ——
+       用户得先滚动才能找到它,很容易误以为软件没反应。 */
+    max-height: 58vh; overflow-y: auto; flex: 0 0 auto;
+  }
+  #settings.hidden { display: none; }
+  #settings .inner { padding: 12px 14px; }
+  #settings .opt {
+    display: flex; align-items: flex-start; gap: 8px; cursor: pointer;
+    padding: 7px 9px; border-radius: 6px;
+  }
+  #settings .opt:hover { background: rgba(128,128,128,.08); }
+  #settings .opt input { margin: 2px 0 0; cursor: pointer; }
+  #settings .opt .txt { flex: 1; }
+  #settings .opt .txt b { font-weight: 500; }
+  #settings .opt .txt span { display: block; color: var(--dim); font-size: 11px; margin-top: 2px; }
+
+  /* ------------------------------------------------------------ 设置:分区 */
+  #settings .sec {
+    margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line);
+  }
+  #settings .sec > .h {
+    font-size: 11px; color: var(--dim); letter-spacing: .5px; margin-bottom: 7px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  #settings .sec > .h .spacer { flex: 1; }
+  #settings input[type=text], #settings input[type=password] {
+    width: 100%; padding: 7px 9px; border-radius: 6px; border: 1px solid var(--line);
+    background: #10131a; color: var(--text); font: 12px/1.4 Consolas, "Cascadia Mono", monospace;
+  }
+  #settings input[type=text]:focus, #settings input[type=password]:focus {
+    outline: none; border-color: var(--accent);
+  }
+  #settings .btnrow { display: flex; gap: 6px; margin-top: 6px; }
+  #settings .btnrow button {
+    flex: 1; width: auto; padding: 6px 8px; font-size: 12px; font-weight: 400;
+  }
+  #settings .note { color: var(--dim); font-size: 11px; margin-top: 6px; }
+  #settings .note b { color: var(--warn); font-weight: 500; }
+
+  /* 小号行内按钮:放行防火墙 / 启动停止代理 */
+  button.mini {
+    width: auto; flex: 0 0 auto; padding: 3px 9px; font-size: 11px; font-weight: 400;
+  }
+  #proxyActions { display: flex; gap: 6px; margin-top: 7px; }
+  #proxyActions button { flex: 1; }
+  #fwHint {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    background: #2a1f10; border: 1px solid #5a4a1a; color: #e8c46a;
+    border-radius: 6px; padding: 7px 9px; font-size: 11px; line-height: 1.5;
+    margin-top: 6px;
+  }
+  #fwHint.hidden { display: none; }
+  #fwHint .spacer { flex: 1; }
+  #fwHint b { color: #f0d089; font-weight: 500; }
+
+  /* 局域网访问:地址列表 + 二维码 */
+  .lanurl {
+    display: flex; align-items: center; gap: 6px; margin-bottom: 5px;
+    background: #10131a; border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
+  }
+  .lanurl .u {
+    flex: 1; font: 11.5px/1.3 Consolas, "Cascadia Mono", monospace;
+    word-break: break-all; color: #c9d1d9;
+  }
+  .lanurl .n { color: var(--dim); font-size: 10.5px; flex: 0 0 auto; }
+  .lanurl.rec { border-color: #3a5a3a; background: #121a14; }
+  .lanurl.rec .n { color: var(--ok); font-weight: 500; }
+  .lanurl button {
+    width: auto; flex: 0 0 auto; padding: 3px 8px; font-size: 11px; font-weight: 400;
+  }
+  #settings .warn {
+    background: #2a1f10; border: 1px solid #5a4a1a; color: #e8c46a;
+    border-radius: 6px; padding: 7px 9px; font-size: 11px; line-height: 1.5;
+    margin-bottom: 7px;
+  }
+  /* 服务没跑时让「启动」按钮自己跳出来,别让人找不到 */
+  button.attention {
+    box-shadow: 0 0 0 2px rgba(76, 141, 255, .35);
+    animation: pulse 1.8s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 2px rgba(76, 141, 255, .35); }
+    50% { box-shadow: 0 0 0 5px rgba(76, 141, 255, .12); }
+  }
+  #qrbox {
+    margin-top: 8px; background: #fff; border-radius: 8px; padding: 8px;
+    width: 176px; height: 176px; align-self: center;
+  }
+  #qrbox.hidden { display: none; }
+  #qrbox svg { display: block; }
+  #qrwhy { color: var(--dim); font-size: 11px; margin-top: 6px; text-align: center; }
+  #qrwhy.hidden { display: none; }
+
+  /* 手机访问步骤 */
+  ol.steps { margin: 6px 0 0; padding-left: 18px; color: var(--dim); font-size: 11px; }
+  ol.steps li { margin-bottom: 3px; }
+  ol.steps code {
+    background: var(--panel-2); padding: 1px 4px; border-radius: 3px;
+    color: #c9d1d9; font-size: 11px;
+  }
+
+  .scroll { overflow-y: auto; flex: 1; }
+  .group { padding: 12px 14px; border-bottom: 1px solid var(--line); }
+  .group.hidden { display: none; }
+  .group > .label {
+    color: var(--dim); font-size: 11px; letter-spacing: .6px; margin-bottom: 8px;
+  }
+
+  .item {
+    display: block; width: 100%; text-align: left; cursor: pointer;
+    background: var(--panel-2); border: 1px solid transparent; border-radius: 7px;
+    color: var(--text); padding: 9px 11px; margin-bottom: 6px; font: inherit;
+  }
+  .item:hover { border-color: #3a4150; }
+  .item.sel { border-color: var(--accent); background: #1e2734; }
+  .item .t { font-weight: 500; }
+  .item .d { color: var(--dim); font-size: 11px; margin-top: 2px; }
+  .item.missing { opacity: .45; cursor: not-allowed; }
+  .item.missing .d { color: var(--warn); }
+  /* 已知有问题的模型:黄色警示条,让人一眼看出别选它 */
+  .item .warnline {
+    margin-top: 5px; padding: 4px 6px; border-radius: 4px;
+    background: #2a2211; border: 1px solid #55451a; color: #e8c46a;
+    font-size: 10.5px; line-height: 1.45;
+  }
+
+  /* ------------------------------------------------------------ 上下文滑块 */
+  .ctx-head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    margin-bottom: 9px;
+  }
+  .ctx-head .label { margin: 0; }
+  .ctx-val { font-size: 12.5px; font-weight: 600; color: var(--accent); }
+  .ctx-val.over { color: var(--warn); }
+
+  /* 轨道上直接画出"实测安全区"(蓝)与"会静默溢出区"(黄)。
+     为什么画在轨道上而不是下面写行小字:溢出是**没有报错**的,用户只会在
+     若干轮对话之后觉得"怎么突然变慢了"。边界必须在拖之前就看得见。 */
+  #ctxRange {
+    -webkit-appearance: none; appearance: none; width: 100%; height: 7px;
+    border-radius: 4px; outline: none; margin: 2px 0; cursor: pointer;
+    border: 1px solid var(--line);
+    background: linear-gradient(to right,
+      #2b4a7d 0%, #2b4a7d var(--safe, 60%),
+      #4a3a17 var(--safe, 60%), #4a3a17 100%);
+  }
+  #ctxRange::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 16px; height: 16px; border-radius: 50%;
+    background: var(--accent); border: 2px solid #0f1115; cursor: grab;
+  }
+  #ctxRange::-webkit-slider-thumb:active { cursor: grabbing; }
+  #ctxRange::-webkit-slider-thumb:hover { box-shadow: 0 0 0 4px rgba(76,141,255,.18); }
+  .ctx-ticks {
+    display: flex; justify-content: space-between;
+    color: var(--dim); font-size: 10px; margin-top: 6px;
+  }
+  .ctx-note { font-size: 11px; line-height: 1.55; margin-top: 7px; color: var(--dim); }
+  .ctx-note.warn { color: #e8c46a; }
+  .ctx-note b { color: var(--text); }
+
+  /* KV 精度选择器。只有两项,用紧凑的分段控件而不是 .item 大卡片 ——
+     两个大卡片会占掉侧栏近三分之一,而它和下面的上下文滑块是同一件事的两面。 */
+  .seg { display: flex; gap: 6px; }
+  .seg button {
+    flex: 1; padding: 7px 8px; border-radius: 7px; border: 1px solid var(--line);
+    background: var(--panel-2); color: var(--text); font: inherit; font-size: 12px;
+    cursor: pointer; font-weight: 500;
+  }
+  .seg button:hover { border-color: #3a4150; }
+  .seg button.sel { border-color: var(--accent); background: #1e2734; }
+  .seg-note { font-size: 11px; line-height: 1.5; color: var(--dim); margin-top: 6px; }
+
+  #controls { padding: 12px 14px; border-top: 1px solid var(--line); }
+  button {
+    width: 100%; padding: 10px; border-radius: 7px; border: 1px solid var(--line);
+    background: var(--panel-2); color: var(--text); font: inherit; cursor: pointer;
+    font-weight: 500;
+  }
+  button:hover:not(:disabled) { border-color: #3a4150; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover:not(:disabled) { background: #3d7ce8; }
+  button.danger { background: #3a2020; border-color: #5a2b2b; color: #ffb4b4; }
+
+  /* ---------------------------------------------------------------- 状态 */
+  #status { padding: 10px 14px; border-top: 1px solid var(--line); font-size: 12px; }
+  .row { display: flex; justify-content: space-between; gap: 10px; padding: 2px 0; }
+  .row .k { color: var(--dim); }
+  .row .v { text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* 探针结论。溢出是红色 —— 这一行是唯一能看出"KV 已经在内存里跑"的地方,
+     显存读数看不出这个(溢出与满速的显存占用实测完全一样)。 */
+  .row .v.bad { color: var(--err); font-weight: 600; }
+  .row .v.ok { color: var(--ok); }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--dim); margin-right: 6px; }
+  .dot.on { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .dot.busy { background: var(--warn); }
+  .dot.err { background: var(--err); }
+
+  /* ---------------------------------------------------------------- 主区 */
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #bar {
+    height: 38px; flex: 0 0 38px; display: flex; align-items: center; gap: 10px;
+    padding: 0 12px; border-bottom: 1px solid var(--line); background: var(--panel);
+    font-size: 12px; color: var(--dim);
+  }
+  #bar .spacer { flex: 1; }
+  #bar button { width: auto; padding: 5px 11px; font-size: 12px; font-weight: 400; }
+  #stage { flex: 1; position: relative; background: #0f1114; }
+  #frame { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+  #frame.hidden { display: none; }
+
+  #placeholder {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 12px; color: var(--dim);
+    text-align: center; padding: 40px;
+  }
+  #placeholder.hidden { display: none; }
+  #placeholder .big { font-size: 34px; opacity: .35; }
+  #placeholder code {
+    background: var(--panel-2); padding: 2px 6px; border-radius: 4px;
+    color: #c9d1d9; font-size: 12px;
+  }
+
+  /* ---------------------------------------------------------------- 日志 */
+  #logwrap { flex: 0 0 auto; border-top: 1px solid var(--line); background: #101216; display: none; }
+  #logwrap.show { display: block; }
+  #log {
+    height: 170px; overflow-y: auto; margin: 0; padding: 8px 12px;
+    font: 11.5px/1.55 Consolas, "Cascadia Mono", monospace; color: #9fb0c4;
+    white-space: pre-wrap; word-break: break-all;
+  }
+</style>
+</head>
+<body>
+
+<aside id="side">
+  <h1>
+    <div class="titles">Model Stove 模型灶台
+      <small>本地模型启动器 · llama-server 图形外壳</small>
+    </div>
+    <button id="btnSettings" title="外壳设置">⚙</button>
+  </h1>
+
+  <div id="settings" class="hidden">
+    <div class="inner">
+      <div class="sec">
+        <div class="h">API KEY
+          <span class="spacer"></span>
+        </div>
+        <input type="text" id="inpKey" placeholder="留空 = 不鉴权(仅本机可用)" spellcheck="false" />
+        <div class="btnrow">
+          <button id="btnGenKey">生成随机</button>
+          <button id="btnSaveKey" class="primary">保存</button>
+          <button id="btnClearKey">清除</button>
+        </div>
+        <div class="note">
+          设置后,llama-server 的所有接口都要带这个 Key。
+          <br />聊天界面自己认识它 —— 手机上第一次打开会弹出输入框,填一次即存住。
+          <br /><b>注意:留空且开启局域网时,同网段任何人都能直接用你的模型。</b>
+        </div>
+      </div>
+
+      <div class="sec">
+        <div class="h">局域网访问
+          <span class="spacer"></span>
+          <button id="btnRefreshNet" style="width:auto;padding:3px 8px;font-size:11px;font-weight:400">刷新地址</button>
+        </div>
+        <label class="opt" style="padding:4px 0">
+          <input type="checkbox" id="optLan" />
+          <span class="txt">
+            <b>允许其它设备连接</b>
+            <span>关闭时只监听 127.0.0.1,手机连不上。改动后需要重新启动服务。</span>
+          </span>
+        </label>
+        <div id="lanList"></div>
+        <div id="qrbox" class="hidden"></div>
+        <div id="qrwhy" class="hidden">手机扫码打开</div>
+        <ol class="steps">
+          <li>在电脑上开<code>移动热点</code>,让手机连上它(校园网常隔离设备,热点最稳)</li>
+          <li>点左侧「启动」并等模型加载完 —— 没启动的话手机只会一直转圈</li>
+          <li>手机扫上面的码或手输地址</li>
+          <li>首次打开会要 API Key,填一次即可</li>
+        </ol>
+      </div>
+
+      <div class="sec">
+        <div class="h">任务档位
+          <span class="spacer"></span>
+          <span id="proxyDot" class="dot"></span>
+        </div>
+        <div id="profileList"></div>
+        <div id="proxyNote" class="warn hidden"></div>
+        <div id="profileNote" class="note"></div>
+        <div id="fwHint" class="note hidden">
+          <b>手机连得上吗?</b>
+          <span id="fwText"></span>
+          <span class="spacer"></span>
+          <button id="btnFw" class="mini">放行防火墙</button>
+        </div>
+        <div id="proxyActions">
+          <button id="btnProxyOn" class="mini">启动代理</button>
+          <button id="btnProxyOff" class="mini">停止代理</button>
+        </div>
+        <label class="opt" style="padding:4px 0">
+          <input type="checkbox" id="optCompress" />
+          <span class="txt">
+            <b>自动压缩上下文</b>
+            <span>历史接近上限时,把较早的对话总结成一段。长对话才需要。</span>
+          </span>
+        </label>
+      </div>
+
+      <div class="sec">
+        <label class="opt" style="padding:4px 0">
+          <input type="checkbox" id="optReasoning" />
+          <span class="txt">
+            <b>显示思考强度选择器</b>
+            <span>开启后侧栏多一栏,可固定「服务级」思考档位。关闭时外壳不传
+              <code>--reasoning-effort</code>,完全交给聊天界面里那个按对话设置的档位。</span>
+          </span>
+        </label>
+        <label class="opt" style="padding:4px 0">
+          <input type="checkbox" id="optProbe" />
+          <span class="txt">
+            <b>启动时做速度探针</b>
+            <span>服务就绪后跑一次固定长度的生成,按 tok/s 判断 KV cache 有没有被挤到内存。
+              那个故障是<b>静默</b>的:不报错、显存读数也看不出,只是慢 6-8 倍。
+              探测要建 CUDA 图,约二三十秒,期间占用唯一的槽位 ——
+              但第一条消息本来也要付这笔钱。关掉可省这段时间。</span>
+          </span>
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <div class="scroll">
+    <div class="group">
+      <div class="label">模型</div>
+      <div id="models"></div>
+    </div>
+    <div class="group">
+      <div class="label">运行预设</div>
+      <div id="presets"></div>
+    </div>
+    <div class="group">
+      <div class="ctx-head">
+        <div class="label">KV cache 精度</div>
+        <div class="ctx-val" id="kvVal">—</div>
+      </div>
+      <div class="seg" id="kvs"></div>
+      <div class="seg-note" id="kvNote"></div>
+    </div>
+    <div class="group">
+      <div class="ctx-head">
+        <div class="label">上下文长度</div>
+        <div class="ctx-val" id="ctxVal">—</div>
+      </div>
+      <input type="range" id="ctxRange" min="0" max="0" step="1" value="0" />
+      <div class="ctx-ticks">
+        <span id="ctxTickMin">8K</span>
+        <span id="ctxTickSafe">—</span>
+        <span id="ctxTickMax">—</span>
+      </div>
+      <div class="ctx-note" id="ctxNote"></div>
+    </div>
+    <div class="group hidden" id="reasoningGroup">
+      <div class="label">思考强度</div>
+      <div id="reasoning"></div>
+    </div>
+    <div class="group" id="budgetGroup">
+      <div class="label">思考预算 <span id="budgetNote" style="text-transform:none;letter-spacing:0"></span></div>
+      <div id="budgets"></div>
+    </div>
+  </div>
+
+  <div id="controls">
+    <button id="btnStart" class="primary">启动</button>
+    <button id="btnStop" class="danger" style="margin-top:7px" disabled>停止</button>
+  </div>
+
+  <div id="status">
+    <div class="row"><span class="k">状态</span><span class="v"><span id="dot" class="dot"></span><span id="stText">未运行</span></span></div>
+    <div class="row"><span class="k">上下文</span><span class="v" id="stCtx">—</span></div>
+    <div class="row"><span class="k">实测速度</span><span class="v" id="stSpeed">—</span></div>
+    <div class="row"><span class="k">运行时长</span><span class="v" id="stUp">—</span></div>
+    <div class="row"><span class="k">端口</span><span class="v" id="stPort">—</span></div>
+  </div>
+</aside>
+
+<main id="main">
+  <div id="bar">
+    <span id="barText">未连接</span>
+    <span class="spacer"></span>
+    <button id="btnReload" disabled>重载界面</button>
+    <button id="btnOpen" disabled>用浏览器打开</button>
+    <button id="btnLog">日志</button>
+  </div>
+
+  <div id="stage">
+    <webview id="frame" class="hidden" src="about:blank" allowpopups></webview>
+    <div id="placeholder">
+      <div class="big">◍</div>
+      <div>左侧选一个模型和预设,然后点「启动」</div>
+      <div style="font-size:12px;max-width:430px">
+        界面直接复用 llama.cpp 自带的 Web 聊天页,外壳只负责进程编排。
+      </div>
+    </div>
+  </div>
+
+  <div id="logwrap">
+    <pre id="log">(暂无日志)</pre>
+  </div>
+</main>
+
+<script src="qr.js"></script>
+<script>
+// 说明:webview 刻意**不**跟随状态轮询重新导航。
+// 给 src 赋值 —— 哪怕值完全一样 —— 也会让 Electron 发起一次导航,
+// 而服务端的界面把每次导航当成一次新会话,于是每隔几秒就多出一个
+// "New chat" 标签页。只在真正变化时导航,并记住实际加载过什么。
+const $ = (id) => document.getElementById(id);
+
+let CATALOGUE = null;
+let selModel = null;
+let selPreset = null;
+let selReasoning = 'medium';
+// 思考预算键名。默认由主进程给(32K),用户可改成「不限」。
+let selBudget = null;
+// 上下文滑块当前值(token)。null 表示"还没动过滑块",此时用预设自带的 ctx。
+let selCtx = null;
+// KV cache 精度键名。它决定上下文滑块的**安全区上界** —— 精度越高 KV 越大,
+// 同样显存能装下的上下文越少(三元版 q4_0 96K / q8_0 48K)。
+let selKv = null;
+let busy = false;
+let loadedUrl = null;
+let frameFailed = false;
+// 服务是否在跑。局域网面板要用它决定是否提示"先点启动"。
+let SERVICE_RUNNING = false;
+
+const REASONING_STORE_KEY = 'model-stove.reasoning';
+const SHOW_REASONING_KEY = 'model-stove.showReasoning';
+const BUDGET_STORE_KEY = 'model-stove.budget';
+const CTX_STORE_KEY = 'model-stove.ctx';
+const KV_STORE_KEY = 'model-stove.kv';
+
+// 侧栏的「思考强度」默认隐藏。
+//
+// 聊天界面自己就带一个按对话设置的档位(输入框 + 菜单里的 Reasoning),
+// 在这里再放一个「服务级」的容易打架,所以默认关掉 —— 外壳不传
+// --reasoning-effort,完全由界面决定。想要服务级固定档位时再打开。
+//
+// 注意:开启并选定档位后,服务端的 flag 会盖住界面里那个按对话的设置,
+// 因为界面里的选择通常以请求参数下发,而服务端 flag 优先级更高。
+// 需要按对话调节时,把这里关掉,或选「跟随模型默认」。
+function loadShowReasoning() {
+  try {
+    const v = localStorage.getItem(SHOW_REASONING_KEY);
+    if (v === '1') return true;
+    if (v === '0') return false;
+  } catch (e) { /* 忽略 */ }
+  return false;
+}
+function saveShowReasoning(v) {
+  try { localStorage.setItem(SHOW_REASONING_KEY, v ? '1' : '0'); } catch (e) { /* 忽略 */ }
+}
+
+function applyReasoningVisibility() {
+  const on = loadShowReasoning();
+  $('reasoningGroup').classList.toggle('hidden', !on);
+  $('optReasoning').checked = on;
+}
+
+/**
+ * 显示启动探针的实测速度。
+ *
+ * 为什么专门占一行:**显存读数看不出 KV 有没有溢出**。实测这两行:
+ *   三元版 @64K + q8_0 : 7869 MiB,只有  4.9 tok/s  (已溢出到内存)
+ *   三元版 @96K + q4_0 : 7869 MiB,却有 31.8 tok/s  (满速)
+ * 一模一样。所以"变慢了"这件事只能靠速度本身报出来,否则用户只会觉得
+ * 模型忽然不听话了,永远查不到原因。
+ */
+function renderSpeed(sp) {
+  const el = $('stSpeed');
+  if (!el) return;
+  el.classList.remove('bad', 'ok');
+  if (!sp) { el.textContent = '—'; return; }
+  if (sp.pending) { el.textContent = '探测中…'; return; }
+  if (sp.failed || sp.tps == null) { el.textContent = '未取得'; return; }
+  if (sp.spilled) {
+    el.textContent = `${sp.tps} tok/s ⚠ 疑似溢出(基线 ${sp.expected})`;
+    el.classList.add('bad');
+    el.title = '速度只有基线的 ' + Math.round((sp.ratio || 0) * 100) + '%。' +
+      '说明 KV cache 已被挪到内存、注意力改由 CPU 算。' +
+      '把上下文调小,或把 KV 精度换回 q4_0。';
+  } else {
+    el.textContent = `${sp.tps} tok/s`;
+    el.classList.add('ok');
+    el.title = '基线和满速≈' + sp.expected + ' tok/s。';
+  }
+}
+
+function fmtUptime(s) {
+  if (!s) return '—';
+  const m = Math.floor(s / 60);
+  return m < 1 ? `${s} 秒` : `${m} 分 ${s % 60} 秒`;
+}
+
+function reasonLabel(key) {
+  const list = (CATALOGUE && CATALOGUE.reasoning) || [];
+  const hit = list.find((r) => r.key === key);
+  return hit ? hit.label : (key || '—');
+}
+
+// 记住思考强度:它是两次运行之间最可能变化的一项。
+function saveReasoning() {
+  try { localStorage.setItem(REASONING_STORE_KEY, selReasoning); } catch (e) { /* 忽略 */ }
+}
+function loadReasoning() {
+  try {
+    const v = localStorage.getItem(REASONING_STORE_KEY);
+    if (v && (CATALOGUE.reasoning || []).some((r) => r.key === v)) return v;
+  } catch (e) { /* 忽略 */ }
+  return 'server-default';
+}
+
+function renderModels() {
+  const box = $('models');
+  box.innerHTML = '';
+  for (const m of CATALOGUE.models) {
+    const b = document.createElement('button');
+    b.className = 'item' + (m.id === selModel ? ' sel' : '') + (m.present ? '' : ' missing');
+    // 逐段用 textContent 填,避免模型名里的特殊字符被当成 HTML
+    const t = document.createElement('div');
+    t.className = 't';
+    t.textContent = m.name;
+    const d = document.createElement('div');
+    d.className = 'd';
+    d.textContent = m.present ? m.note : '文件缺失:' + m.file;
+    b.appendChild(t);
+    b.appendChild(d);
+    // 已知有问题的模型直接标在卡片上 —— 否则用户只能靠名字猜
+    if (m.warn) {
+      const w = document.createElement('div');
+      w.className = 'warnline';
+      w.textContent = '⚠ ' + m.warn;
+      b.appendChild(w);
+    }
+    if (m.present) {
+      b.onclick = () => {
+        selModel = m.id;
+        selPreset = m.defaultPreset;
+        // 换模型时把滑块交还给预设 —— 各模型的实测安全上限差一倍
+        // (196K vs 96K),沿用旧值很容易一进去就落在黄色区。
+        selCtx = null;
+        renderModels(); renderPresets(); renderCtx(); refreshButtons();
+      };
+    }
+    box.appendChild(b);
+  }
+}
+
+function renderPresets() {
+  const box = $('presets');
+  box.innerHTML = '';
+  for (const p of CATALOGUE.presets) {
+    const b = document.createElement('button');
+    b.className = 'item' + (p.key === selPreset ? ' sel' : '');
+    b.innerHTML = `<div class="t">${p.label}${p.vision ? ' · 视觉' : ''}</div>
+      <div class="d">${p.hint}</div>`;
+    // 点预设把滑块带回该预设的上下文,之后仍可自由拖动微调。
+    // ⚠ 2026-09-29:把 selCtx = p.ctx 改成 selCtx = null,即"跟随预设"。
+    //   原来直接写死预设的数字,等于把它变成了**用户显式选择**,
+    //   从而绕过按 KV 精度做的安全夹取 —— 三值模型 + q8_0(安全 49152)
+    //   配"长文本 64K"预设(65536)就会静默掉到 1/6~1/8 速度。
+    //   置 null 之后由 renderCtx() 显示、由 config.js 的 buildArgs() 取数,
+    //   两处都按当前 KV 精度夹到安全上限。用户之后手动拖滑块仍是显式选择。
+    b.onclick = () => { selPreset = p.key; selCtx = null; renderPresets(); renderCtx(); refreshButtons(); };
+    box.appendChild(b);
+  }
+}
+
+function renderReasoning() {
+  const box = $('reasoning');
+  box.innerHTML = '';
+  for (const r of (CATALOGUE.reasoning || [])) {
+    const b = document.createElement('button');
+    b.className = 'item' + (r.key === selReasoning ? ' sel' : '');
+    b.innerHTML = `<div class="t">${r.label}</div>
+      <div class="d">${r.hint}${r.flag ? ' · --reasoning-effort ' + r.flag : ''}</div>`;
+    b.onclick = () => { selReasoning = r.key; saveReasoning(); renderReasoning(); refreshButtons(); };
+    box.appendChild(b);
+  }
+}
+
+/**
+ * 思考预算选择器。
+ *
+ * 这是一道**保险**,不是常态约束:llama-server 默认不限(-1),而模型偶尔会陷进
+ * 重复生成(见过 reasoning 区一直刷同一个字符)。给个上限就能自己收住,
+ * 不必手动停服务。默认 32K —— 宽到让难题的深度思考跑完,只在真失控时触发。
+ * 想要完全不干预就选「不限」。
+ *
+ * 注意与「思考强度」的区别:那个管**多深**(--reasoning-effort),这个管**多长**。
+ */
+function renderBudgets() {
+  const box = $('budgets');
+  box.innerHTML = '';
+  const list = CATALOGUE.budgets || [];
+  for (const b of list) {
+    const el = document.createElement('button');
+    el.className = 'item' + (b.key === selBudget ? ' sel' : '');
+    el.innerHTML = `<div class="t">${b.label}</div><div class="d">${b.hint}</div>`;
+    el.onclick = () => {
+      selBudget = b.key;
+      saveBudget();
+      renderBudgets();
+      budgetHint();
+      refreshButtons();
+    };
+    box.appendChild(el);
+  }
+  budgetHint();
+}
+
+/** 提醒这个改动要重启服务才生效 —— 它是启动参数。 */
+function budgetHint() {
+  const note = $('budgetNote');
+  if (!note) return;
+  const b = (CATALOGUE.budgets || []).find((x) => x.key === selBudget);
+
+  // 2026-09-29 新增:预算 ↔ 上下文 一致性检查。
+  //
+  // 这两个都是**启动参数**,彼此完全不知道对方存在。预算不小于上下文时,
+  // 思考能把上下文整个吃光,正文就没地方放了 —— 这是"空回答"的另一条独立路径
+  // (与"客户端 max_tokens 小于思考长度"那条不同,那条我们管不着)。
+  //
+  // 实测(2026-09-29,本机):预算 16384 > 输出上限 12288 时,同一个模型给出
+  // 31185 字思考、**正文 0 字**,而且思考断在半个词中间。
+  //
+  // 顺带说明为什么护栏放这里而不是代理里:代理里原本有一处 `reasoning_budget = 4096`,
+  // 但那个字段名是错的(正确名 `reasoning_budget_tokens`),从来没生效过 —— 已删。
+  const preset = (CATALOGUE.presets || []).find((x) => x.key === selPreset);
+  const ctx = selCtx || (preset ? preset.ctx : null);
+  if (b && b.value > 0 && ctx && b.value >= ctx) {
+    note.textContent = ` ⚠ 预算 ${fmtCtx(b.value)} ≥ 上下文 ${fmtCtx(ctx)}` +
+      `:思考会把上下文吃光,正文没地方放(空回答)`;
+    return;
+  }
+
+  note.textContent = b && b.value < 0 ? '(不限,不干预)' : '';
+}
+
+function saveBudget() {
+  try { localStorage.setItem(BUDGET_STORE_KEY, selBudget); } catch (e) { /* 忽略 */ }
+}
+function loadBudget() {
+  try {
+    const v = localStorage.getItem(BUDGET_STORE_KEY);
+    if (v && (CATALOGUE.budgets || []).some((b) => b.key === v)) return v;
+  } catch (e) { /* 忽略 */ }
+  return CATALOGUE.defaultBudget || null;
+}
+
+// ---------------------------------------------------------------- 上下文滑块
+
+/** 当前选中的模型对象。滑块的上限由它决定,不是全局常量。 */
+function currentModel() {
+  return (CATALOGUE.models || []).find((m) => m.id === selModel) || null;
+}
+
+/** 当前 KV 精度键名,收敛成 catalogue 里的合法值。 */
+function currentKv() {
+  const list = CATALOGUE.kvTypes || [];
+  return list.some((k) => k.key === selKv) ? selKv : (CATALOGUE.defaultKv || (list[0] && list[0].key) || null);
+}
+
+/**
+ * 当前「模型 + KV 精度」下,本机实测不会溢出的上下文。
+ *
+ * 必须两个一起看:同一个值对 q4_0 安全、对 q8_0 就可能溢出。主进程给的是
+ * 整张表(`safeCtx: { q4_0: …, q8_0: … }`),这里按当前精度取一格 ——
+ * 放在渲染层解析,是为了拖动 KV 选择器时安全区能立刻联动,不必再走一次 IPC。
+ */
+function safeCtxNow() {
+  const m = currentModel();
+  if (!m || !m.safeCtx) return null;
+  if (typeof m.safeCtx === 'number') return m.safeCtx;    // 兼容旧写法
+  return m.safeCtx[currentKv()] || null;
+}
+
+function renderKv() {
+  const box = $('kvs');
+  const list = CATALOGUE.kvTypes || [];
+  const cur = currentKv();
+  // 把解析后的值写回状态,和 renderCtx() 对 selCtx 的做法一致 ——
+  // 否则 selKv 会停在 null,虽然各处都能靠 currentKv() 兜底,
+  // 但"状态是 null、显示是 q4_0"这种不一致迟早会在别处咬人。
+  selKv = cur;
+  box.innerHTML = '';
+  for (const k of list) {
+    const b = document.createElement('button');
+    b.className = k.key === cur ? 'sel' : '';
+    b.textContent = k.label;
+    b.title = k.hint || '';
+    b.onclick = () => {
+      selKv = k.key;
+      saveKv();
+      // 精度一换,安全区就变 —— 上下文那边必须跟着重画,否则会显示错的上界。
+      //
+      // ⚠ 2026-09-29:光重画不够,还得把**值**夹回来。renderCtx() 结尾会执行
+      //   `selCtx = steps[idx]`,把"跟随预设"的 null 钉成具体数字;于是
+      //   "先选预设、再切 KV"这条路径手里拿的还是旧精度下的值 ——
+      //   三值模型 q4_0 安全 98304,预设 65536 没问题;一旦切到 q8_0(安全 49152),
+      //   65536 会原地留着 → 静默溢出、速度掉 6-8 倍,而界面只标一个 ⚠。
+      //   这里按新精度夹一次,与 config.js 对"预设来源"的夹取语义保持一致。
+      const s = safeCtxNow();
+      if (selCtx && s && selCtx > s) selCtx = s;
+      renderKv(); renderCtx(); refreshButtons();
+    };
+    box.appendChild(b);
+  }
+  const active = list.find((k) => k.key === cur);
+  $('kvVal').textContent = cur || '—';
+  $('kvNote').textContent = active ? active.hint : '';
+}
+
+function saveKv() { try { localStorage.setItem(KV_STORE_KEY, String(selKv)); } catch (e) { /* 忽略 */ } }
+function loadKv() {
+  try {
+    const v = localStorage.getItem(KV_STORE_KEY);
+    if (v) return v;
+  } catch (e) { /* 忽略 */ }
+  return null;
+}
+
+/**
+ * 这个模型可选的上下文档位。
+ *
+ * 从全局 ctxSteps 里筛,并以 maxCtx 为**硬顶** —— 超出的档位干脆不出现。
+ * 比"让用户拖过头再报错"省事:看得见的选项都是能用的。
+ */
+function ctxStepsFor(model) {
+  const all = CATALOGUE.ctxSteps || [8192];
+  if (!model || !model.maxCtx) return all;
+  const list = all.filter((s) => s <= model.maxCtx);
+  return list.length ? list : [all[0]];
+}
+
+function fmtCtx(n) {
+  if (!n) return '—';
+  return n >= 1024 ? Math.round(n / 1024) + 'K' : String(n);
+}
+
+/**
+ * 画滑块,并按当前模型标出「实测安全区」。
+ *
+ * safe 是**本机实测不会溢出**的值,由主进程从 config.js 给 —— 不是这里猜的。
+ * 轨道左侧蓝色 = 安全,safe 右侧黄色 = 会静默溢出到内存。
+ *
+ * 为什么要费劲画这条分界:溢出时 llama.cpp **不报错、不退出**,只是把 KV cache
+ * 挪到主机内存、注意力改由 CPU 算。用户只会觉得"怎么突然变慢了",查不到原因。
+ * 边界必须在拖动之前就看得见。
+ */
+function renderCtx() {
+  const input = $('ctxRange');
+  const model = currentModel();
+  const steps = ctxStepsFor(model);
+  input.min = '0';
+  input.max = String(steps.length - 1);
+  input.step = '1';
+
+  // 安全上限先算出来 —— 下面夹预设值要用它,而它随当前 KV 精度变。
+  const safe = safeCtxNow() || steps[steps.length - 1];
+
+  // 当前值吸附到最近的合法档位 —— 换了模型之后,原值可能已经越界。
+  let cur = selCtx;
+  if (cur === null || cur === undefined) {
+    const p = (CATALOGUE.presets || []).find((x) => x.key === selPreset);
+    cur = p ? p.ctx : steps[steps.length - 1];
+    // ⚠ 2026-09-29:预设来源的值也要夹到安全上限。预设 ctx 是固定数字,
+    //   安全上限却随 KV 精度变(三值模型 q8_0 只有 49152,而"长文本 64K"是 65536)。
+    //   必须和 config.js 的 buildArgs() 夹得**一致**,否则会出现
+    //   "界面显示 64K、实际以 48K 启动"这种对不上的状态。
+    if (cur > safe) cur = safe;
+  }
+  let idx = 0;
+  for (let i = 0; i < steps.length; i++) {
+    if (Math.abs(steps[i] - cur) < Math.abs(steps[idx] - cur)) idx = i;
+  }
+  input.value = String(idx);
+  selCtx = steps[idx];
+  const max = steps[steps.length - 1];
+  const over = selCtx > safe;
+
+  // 安全区占轨道的比例,喂给 CSS 渐变当色标。
+  const span = max - steps[0];
+  const ratio = span > 0 ? (Math.min(safe, max) - steps[0]) / span : 1;
+  input.style.setProperty('--safe', (ratio * 100).toFixed(1) + '%');
+
+  const val = $('ctxVal');
+  val.textContent = fmtCtx(selCtx) + (over ? ' ⚠' : '');
+  val.classList.toggle('over', over);
+
+  $('ctxTickMin').textContent = fmtCtx(steps[0]);
+  $('ctxTickSafe').textContent = safeCtxNow() ? '实测安全 ' + fmtCtx(safe) : '';
+  $('ctxTickMax').textContent = fmtCtx(max);
+
+  const note = $('ctxNote');
+  note.classList.toggle('warn', over);
+  // 文案里的数字都从当前模型取,不写死 —— 写死过一次,加了新模型就成了事实错误。
+  const cm = currentModel() || {};
+  const pt = cm.probeTps;      // 本模型实测基线 tok/s(没有就不编数字)
+  const kl = cm.kvLayers;      // 混合注意力:总层数 / 带 KV 的层数
+  if (!model) {
+    note.textContent = '';
+  } else if (over) {
+    note.innerHTML = `已超过 <b>${currentKv() || ''}</b> 精度下、本机实测的安全上限 ` +
+      `<b>${fmtCtx(safe)}</b>。超过后 KV cache 被挪到内存、注意力改由 CPU 算,` +
+      `<b>速度掉约 6-8 倍而且不报错</b>` +
+      (pt ? `(本模型实测基线约 ${pt} t/s,也就是掉到 ${Math.max(1, Math.round(pt / 7))} t/s 左右)` : '') +
+      `。<br />`;
+    // ⚠ 2026-09-30:原文案写死"把 KV 精度换回 q4_0" —— 当用户**已经**是 q4_0 时,
+    //   那是一句空话(它写于"q8_0 才是瓶颈"的年代)。现在按当前精度分支,
+    //   并补上实测存在、但文案里从没提过的第三条路:把 --n-cpu-moe 调大,
+    //   让更多专家留在内存、腾出显存给上下文(代价是生成变慢)。
+    const kvNow = currentKv() || '';
+    const altSafe = (cm.safeCtx || {})[kvNow === 'q8_0' ? 'q4_0' : 'q8_0'];
+    const upHint = kvNow === 'q8_0'
+      ? `想开更大:把 KV 精度换回 <b>q4_0</b>${altSafe ? `(安全上限 ${fmtCtx(altSafe)})` : ''},或换权重更小的模型。`
+      : `想开更大:当前已是 <b>${kvNow}</b>。要么换权重更小的模型,要么把 <b>--n-cpu-moe 调大</b>` +
+        `腾出显存给上下文(实测:<code>28</code> 档 5910 MiB vs <code>24</code> 档 7086 MiB,` +
+        `少占约 1.2 GB;代价是生成变慢)。`;
+    note.innerHTML += upHint;
+  } else {
+    // ⚠ 2026-09-29:这里原来写死"这两个模型…64 层里只有 16 层带 KV cache"。
+    //   加了 Qwen3.6/3.8-35B-A3B(40 层 / 10 层)之后,那句话就是**事实错误**了。
+    //   改成从模型的 kvLayers 取数;没有该字段时退回一句不含具体数字的说法。
+    note.innerHTML = (kl
+      ? `这个模型是<b>混合注意力</b>架构(${kl.total} 层里只有 ${kl.withKv} 层带 KV cache),`
+      : `这个模型是<b>混合注意力</b>架构(只有一部分层带 KV cache),`) +
+      `所以上下文比同尺寸普通模型便宜得多 —— 吃显存的从来是权重,不是上下文。` +
+      `<br />提高 KV 精度会让 KV 变大,安全上限随之减半。`;
+  }
+
+  // 预算与上下文是两个独立的启动参数,换模型/换 KV/拖上下文之后
+  // 预算提示可能已经过期 —— 这里保持一致(见 budgetHint 的说明)。
+  budgetHint();
+}
+
+function saveCtx() {
+  try { localStorage.setItem(CTX_STORE_KEY, String(selCtx)); } catch (e) { /* 忽略 */ }
+}
+function loadCtx() {
+  try {
+    const v = Number(localStorage.getItem(CTX_STORE_KEY));
+    if (Number.isFinite(v) && v > 0) return v;
+  } catch (e) { /* 忽略 */ }
+  return null;
+}
+
+function refreshButtons() {
+  $('btnStart').disabled = busy || !selModel || !selPreset;
+  $('btnStart').textContent = busy ? '启动中…' : '启动';
+}
+
+function setDot(cls, text) {
+  $('dot').className = 'dot' + (cls ? ' ' + cls : '');
+  $('stText').textContent = text;
+}
+
+async function refresh() {
+  const s = await window.shell.status();
+  const wasRunning = SERVICE_RUNNING;
+  SERVICE_RUNNING = !!s.running;
+  // 状态变化时重画局域网面板 —— 那句"服务未运行"的提示要能自己消失。
+  if (wasRunning !== SERVICE_RUNNING) {
+    renderLan();
+    $('btnStart').classList.toggle('attention', !SERVICE_RUNNING && !busy);
+  }
+  if (s.running) {
+    // 区分"本外壳在管"和"端口上有东西在跑"。
+    //
+    // 后者是真实出现过的状态:8091 上跑着一只别处起的 llama-server(占了
+    // 7.3 GB 显存),界面照样显示"运行中",而停止按钮按下去没反应 ——
+    // 因为那时它只肯停自己 spawn 的子进程。现在停止按钮会按端口把它收掉,
+    // 所以这里要把这件事说清楚,而不是显示成一切正常。
+    if (s.external) {
+      setDot('busy', '运行中(外部)');
+      $('barText').textContent = `8091 上有服务在跑,但不是本外壳启动的 · 点「停止」会一并收掉它`;
+    } else {
+      setDot('on', '运行中');
+      $('barText').textContent = `${s.modelName || ''} · ${s.preset || ''}` +
+        (s.reasoning ? ` · 思考:${reasonLabel(s.reasoning)}` : '');
+    }
+    $('stCtx').textContent = (s.ctx ? s.ctx.toLocaleString() + ' tokens' : '—') +
+      (s.kv ? ' · ' + s.kv : '');
+    renderSpeed(s.speed);
+    $('stUp').textContent = fmtUptime(s.uptimeSec);
+    $('btnStop').disabled = false;
+    $('btnReload').disabled = false;
+    $('btnOpen').disabled = false;
+    showFrame(s.url);
+  } else {
+    setDot(busy ? 'busy' : '', busy ? '启动中' : '未运行');
+    $('stCtx').textContent = '—';
+    renderSpeed(null);
+    $('stUp').textContent = '—';
+    $('barText').textContent = '未连接';
+    $('btnStop').disabled = true;
+    $('btnReload').disabled = true;
+    $('btnOpen').disabled = true;
+    hideFrame();
+  }
+}
+
+function showFrame(url) {
+  const f = $('frame');
+  $('placeholder').classList.add('hidden');
+  f.classList.remove('hidden');
+  if (loadedUrl === url) return;          // 已经在显示了,什么都不做
+  loadedUrl = url;
+  frameFailed = false;
+  // 导航前先把 Key 注入 webview 的存储,免得界面一起就撞 401。
+  frameKeyDone = false;
+  injectApiKeyIntoFrame();
+  f.setAttribute('src', url);
+}
+
+/**
+ * 把外壳里存的 API Key 写进 webview 的 localStorage,让桌面端不必手输。
+ *
+ * 为什么需要:--api-key 是**服务级**的,它一视同仁地挡住所有人,包括本机
+ * 这个界面。聊天界面把 Key 存在自己的 localStorage 里,但那个存储属于
+ * webview 的会话分区,外壳重启后可能拿不到,于是每次都弹一次输入框。
+ *
+ * 而桌面这台机器的主人本来就能直接读 settings.json —— 让他再手输一遍
+ * 没有任何安全收益,只有麻烦。Key 依然只对**局域网**有意义(手机必须输)。
+ *
+ * 存储键名 "LlamaUi.config" 是**从实际 bundle 里读出来的**:前端用
+ * localStorage.setItem(`${ou}.config`, ...) 保存配置,而 ou = "LlamaUi"。
+ * 这类键名不是公开接口,上游随时可能改,所以整段包在 try/catch 里 ——
+ * 最坏结果只是退回"手动输一次",不会把界面搞坏。
+ */
+function injectApiKeyIntoFrame() {
+  const key = (SETTINGS.apiKey || '').trim();
+  if (!key) return;
+  const f = $('frame');
+  const code = `(function(){try{var k='LlamaUi.config';var cur={};try{cur=JSON.parse(localStorage.getItem(k)||'{}')||{}}catch(e){}cur.apiKey=${JSON.stringify(key)};localStorage.setItem(k,JSON.stringify(cur))}catch(e){}})()`;
+  const run = () => { try { f.executeJavaScript(code).catch(() => {}); } catch (e) { /* 忽略 */ } };
+  run();
+  // 再等一次:executeJavaScript 在页面还在导航时可能落到旧文档上。
+  setTimeout(run, 1200);
+}
+
+function hideFrame() {
+  const f = $('frame');
+  // 只有在真的加载了东西时才导航离开。每轮轮询都重新赋 src
+  // 会让 Electron 每次都发起(然后中止)一次导航。
+  if (loadedUrl !== null && loadedUrl !== 'about:blank') {
+    loadedUrl = 'about:blank';
+    frameFailed = false;
+    f.setAttribute('src', 'about:blank');
+  }
+  f.classList.add('hidden');
+  $('placeholder').classList.remove('hidden');
+}
+
+function initFrameDiagnostics() {
+  const f = $('frame');
+  f.addEventListener('did-fail-load', (e) => {
+    // -3 是 ERR_ABORTED,我们自己把 src 复位成 about:blank 时就会触发,忽略。
+    if (e.errorCode === -3) return;
+    frameFailed = true;
+    $('barText').textContent = '界面加载失败:' + (e.errorDescription || e.errorCode);
+  });
+  f.addEventListener('did-finish-load', () => {
+    if (frameFailed) { frameFailed = false; refresh(); }
+  });
+}
+
+async function doStart() {
+  busy = true; refreshButtons(); setDot('busy', '启动中');
+  // 选择器隐藏时不传思考档位,让界面自己控制。
+  const reasoning = loadShowReasoning() ? selReasoning : null;
+  // 局域网开关从设置里读,和 API Key 一起生效。
+  const lanMode = !!SETTINGS.lanMode;
+  const r = await window.shell.start(selModel, selPreset, reasoning, lanMode, selBudget, selCtx, selKv);
+  busy = false; refreshButtons();
+  if (!r.ok) {
+    setDot('err', '启动失败');
+    $('barText').textContent = '启动失败';
+    await showLogs();
+    alert('启动失败:\n\n' + r.error);
+    return;
+  }
+  await refresh();
+}
+
+async function doStop() {
+  const b = $('btnStop');
+  b.disabled = true;
+  b.textContent = '停止中…';
+  let r = null;
+  try { r = await window.shell.stop(); } catch { /* 下面按失败处理 */ }
+  b.textContent = '停止';
+  b.disabled = false;
+  await refresh();
+  // 给一句明确反馈。尤其是"停掉了外部进程"这种情况 —— 用户按停止时
+  // 未必知道 8091 上那个不是本外壳起的,不说清楚会以为是按坏了。
+  if (r && r.adopted) {
+    $('barText').textContent = `已停止 8091 上的服务(它不是本外壳启动的)`;
+  } else if (r && r.stopped && r.stopped.length) {
+    $('barText').textContent = '已停止';
+  } else if (SERVICE_RUNNING) {
+    $('barText').textContent = '停止失败:8091 上仍然有服务在应答,看日志';
+  }
+}
+
+// ------------------------------------------------------------------ 设置面板
+
+let SETTINGS = { apiKey: '', lanMode: false, addresses: [] };
+
+/**
+ * 重画局域网地址列表。
+ *
+ * 会列出所有非回环 IPv4,因为这台机器通常同时挂着 WiFi 和热点虚拟网卡,
+ * 而哪个能通取决于手机连的是哪个网络。但**列表顺序由主进程排好了**:
+ * 热点网卡在前,因为它就是手机连上后实际走的那个地址。
+ * 第一个地址会被编进二维码,所以顺序错了二维码就会指错地方。
+ */
+function renderLan() {
+  const box = $('lanList');
+  const list = (SETTINGS.addresses || []);
+  box.innerHTML = '';
+
+  if (!SETTINGS.lanMode) {
+    box.innerHTML = '<div class="note">局域网访问已关闭。开启后才能用手机连接。</div>';
+    $('qrbox').classList.add('hidden');
+    $('qrwhy').classList.add('hidden');
+    return;
+  }
+  if (!list.length) {
+    box.innerHTML = '<div class="note">没找到可用的局域网地址。先连上 WiFi 或开热点,再点「刷新地址」。</div>';
+    $('qrbox').classList.add('hidden');
+    $('qrwhy').classList.add('hidden');
+    return;
+  }
+
+  // 服务没在跑的时候,把这件事说在最前面 —— 否则用户扫码后只会看到
+  // 手机浏览器一直转圈,根本猜不到是后面没有服务。
+  if (!SERVICE_RUNNING) {
+    const warn = document.createElement('div');
+    warn.className = 'warn';
+    warn.textContent = '服务当前未运行。地址和二维码已经就绪,但必须先点左侧「启动」,手机才连得上。';
+    box.appendChild(warn);
+  }
+
+  list.forEach((a, i) => {
+    const row = document.createElement('div');
+    row.className = 'lanurl';
+    row.innerHTML = `<span class="u"></span><span class="n"></span>`;
+    // 用 textContent 而不是 innerHTML:网卡名和地址都是外部数据
+    row.querySelector('.u').textContent = a.url;
+    // 热点那条标出来,告诉用户该扫哪个
+    row.querySelector('.n').textContent = a.recommended ? '热点 · 手机连这个' : a.name;
+    if (a.recommended) row.classList.add('rec');
+    const copy = document.createElement('button');
+    copy.textContent = '复制';
+    copy.onclick = () => {
+      navigator.clipboard.writeText(a.url).then(
+        () => { copy.textContent = '已复制'; setTimeout(() => (copy.textContent = '复制'), 1200); },
+        () => { copy.textContent = '失败'; setTimeout(() => (copy.textContent = '复制'), 1200); }
+      );
+    };
+    row.appendChild(copy);
+    box.appendChild(row);
+  });
+
+  // 二维码指向哪里取决于代理是否在跑:
+  //   代理在线 -> 指向代理端口,这样**任务档位与自动压缩才生效**
+  //   否则     -> 指向 llama-server 端口(功能少,但至少能用)
+  // 之前这里固定用 list[0].url(即 llama-server 端口),结果是二维码把你带到
+  // 一个档位完全不起作用的地址,而面板又显示「代理未运行」,两处互相打架。
+  const first = list[0];
+  if (PROXY.online) {
+    const proxyUrl = `http://${first.address}:${PROXY.port}/`;
+    renderQr(proxyUrl, '带档位与压缩');
+
+    // 代理在本地能应答,不代表手机连得上 —— 中间还隔着防火墙的入站规则。
+    // 这两件事必须分开说,否则界面会给出"一切正常"的错误结论。
+    if (!proxyLanReady()) {
+      const warn = document.createElement('div');
+      warn.className = 'warn';
+      warn.textContent = `注意:防火墙还没有放行 node.exe 的入站连接,手机访问 ${first.address}:${PROXY.port} 会一直被丢包(表现就是一直转圈)。点上面「放行防火墙」解决。`;
+      box.appendChild(warn);
+    }
+    // 把直连地址也列出来,并标明差异:两者是不同来源,聊天记录各自独立
+    const alt = document.createElement('div');
+    alt.className = 'note';
+    alt.textContent = `若要绕过代理直连模型,把地址换成 :${CATALOGUE.port} 端口即可 —— 那样不带档位与压缩,且聊天记录是另一套(浏览器按地址隔离存储)。`;
+    box.appendChild(alt);
+  } else {
+    const warn = document.createElement('div');
+    warn.className = 'warn';
+    warn.textContent = `代理当前没有运行,二维码指向的是直连地址 :${CATALOGUE.port} —— 任务档位与自动压缩在那里不生效。建议先在「任务档位」里点「启动代理」。`;
+    box.appendChild(warn);
+    renderQr(first.url, '直连 · 无档位');
+  }
+}
+
+/**
+ * 把地址画成二维码。
+ *
+ * 刻意**不**把 API Key 编进码里:二维码会被截图、会被别人看到,
+ * 而 Key 只该由用户在手机上亲手输一次。码里只有地址。
+ */
+function renderQr(url, note) {
+  const box = $('qrbox');
+  const why = $('qrwhy');
+  try {
+    box.innerHTML = window.ModelStoveQR.toSvg(url, { quiet: 1 });
+    box.classList.remove('hidden');
+    why.textContent = '扫码打开 · ' + url + (note ? '  (' + note + ')' : '');
+    why.classList.remove('hidden');
+  } catch (e) {
+    // 地址太长或二维码模块出错时,不该把整个设置面板拖垮
+    box.classList.add('hidden');
+    why.textContent = '二维码生成失败:' + e.message;
+    why.classList.remove('hidden');
+  }
+}
+
+async function loadSettingsToUi() {
+  SETTINGS = await window.shell.getSettings();
+  $('inpKey').value = SETTINGS.apiKey || '';
+  $('optLan').checked = !!SETTINGS.lanMode;
+  // 主进程缺省返回 true(没设过 = 开),这里如实反映,不要自己再兜一层默认。
+  $('optProbe').checked = SETTINGS.probe !== false;
+  renderLan();
+}
+
+async function refreshNet() {
+  SETTINGS.addresses = await window.shell.addresses();
+  renderLan();
+}
+
+// ------------------------------------------------------ 任务档位 / 压缩代理
+
+/**
+ * 代理状态。代理是独立进程,没启动时下面所有操作都不可用 ——
+ * 所以必须区分"没在跑"和"出错了",否则用户只会看到按钮没反应。
+ */
+let PROXY = { online: false, profile: null, profiles: [], compressEnabled: null, error: null };
+
+/**
+ * 防火墙自检结果。
+ *
+ * 为什么这件事要摆在界面上:手机连不上的原因里,有一类不是"服务没起",
+ * 而是**端口进不来**。Windows 防火墙默认 BlockInbound,而入站允许规则
+ * **按配置文件生效** —— 手机热点时段本机被判为 Public,这时能不能连进来
+ * 取决于对应程序有没有 Public 入站规则。浏览器表现就是"卡在加载界面",
+ * 而电脑这边看不出任何异常。
+ *
+ * 判据读**注册表**,不解析 netsh 的输出:中文 Windows 上 netsh 的字段标签是
+ * "规则名称:"而不是 "Rule Name",匹配英文永远不会命中,会把"规则存在"误判成
+ * "不存在"(我就因此给过一次错误的故障结论)。详见 src/main.js 的
+ * readFirewallRuleValues 与 tools/firewall-rules.ps1。
+ *
+ * 查询规则不需要管理员,所以可以随时自检;真正添加规则必须提权,只能走 UAC。
+ */
+let FW = { node: null, app: null };
+
+/**
+ * 代理该不该被当成"手机能连"。
+ *
+ * 代理在本地起得来(127.0.0.1 能通)不等于手机连得上 —— 这两个判断必须分开,
+ * 否则界面会给出"一切正常"的错误结论。这里只能做保守推断:
+ *   node 规则存在 -> 认为可以
+ *   规则缺失       -> 明确警告,并给出一键放行
+ */
+function proxyLanReady() {
+  if (!PROXY.online) return false;
+  if (!FW.node) return false;
+  return !!FW.node.present;
+}
+
+function renderFwHint() {
+  const box = $('fwHint');
+  const txt = $('fwText');
+  // 代理没在跑时这条提示没有意义 —— 那时的问题在"代理没起",不是防火墙。
+  if (!PROXY.online) { box.classList.add('hidden'); return; }
+  if (!FW.node) { box.classList.add('hidden'); return; }
+
+  if (FW.node.present) {
+    box.classList.add('hidden');
+    return;
+  }
+  box.classList.remove('hidden');
+  txt.textContent = '代理是用 node.exe 跑的,而注册表里没有它的入站允许规则 —— 手机访问可能一直被丢包(表现就是一直转圈)。点右边按钮放行,会弹一次 UAC。';
+}
+
+async function loadFirewall() {
+  try { FW = await window.shell.firewallStatus(); } catch { FW = { node: null, app: null }; }
+  renderFwHint();
+}
+
+/**
+ * 画档位选择列表。
+ *
+ * 档位之所以必要:同一套采样参数不可能同时适合推理和创作。实测里「推理」档
+ * 写小说会**输出为空** —— 开思考后整个 token 预算被思考吃光。所以这不是
+ * "调优",而是避免用错档。
+ */
+function renderProfiles() {
+  const box = $('profileList');
+  const dot = $('proxyDot');
+  const note = $('profileNote');
+  const pnote = $('proxyNote');
+  box.innerHTML = '';
+  pnote.classList.add('hidden');
+  pnote.textContent = '';
+
+  const onBtn = $('btnProxyOn');
+  const offBtn = $('btnProxyOff');
+
+  if (!PROXY.online) {
+    dot.className = 'dot err';
+    // 代理现在是外壳托管的,所以这里不再让人去命令行敲 node ——
+    // "忘了启动代理"曾经是最常见的故障源。
+    note.textContent = '档位与自动压缩由代理提供,它没有在运行。点下面的「启动代理」。';
+    pnote.classList.remove('hidden');
+    pnote.textContent = PROXY.error
+      ? ('连不上代理:' + PROXY.error)
+      : '代理未启动';
+    // 把托管层记下的失败原因也摊开,否则用户只能看到"没起来"。
+    const why = PROXY.lifecycle && PROXY.lifecycle.lastError;
+    if (why && why !== PROXY.error) pnote.textContent += ' —— ' + why;
+    $('optCompress').disabled = true;
+    onBtn.classList.remove('hidden');
+    onBtn.disabled = false;
+    offBtn.classList.add('hidden');
+    renderFwHint();
+    return;
+  }
+
+  dot.className = 'dot on';
+  $('optCompress').disabled = false;
+  $('optCompress').checked = !!PROXY.compressEnabled;
+
+  for (const p of PROXY.profiles) {
+    const el = document.createElement('button');
+    el.className = 'item' + (p.key === PROXY.profile ? ' sel' : '');
+    const t = document.createElement('div');
+    t.className = 't';
+    t.textContent = p.label;
+    const d = document.createElement('div');
+    d.className = 'd';
+    d.textContent = p.hint;
+    el.appendChild(t);
+    el.appendChild(d);
+    el.onclick = () => chooseProfile(p.key);
+    box.appendChild(el);
+  }
+
+  const lc = PROXY.lifecycle || {};
+  const origin = lc.managed ? '外壳托管' : (lc.external ? '外部启动' : '');
+  note.textContent = [PROXY.profileDetail, origin].filter(Boolean).join(' · ');
+
+  onBtn.classList.add('hidden');
+  offBtn.classList.remove('hidden');
+  offBtn.disabled = !lc.managed;
+
+  renderFwHint();
+}
+
+async function chooseProfile(key) {
+  const r = await window.shell.setProfile(key);
+  if (!r.ok) {
+    $('profileNote').textContent = '切换失败:' + (r.error || '未知错误');
+    return;
+  }
+  PROXY.profile = r.profile;
+  await loadProxyStatus();
+}
+
+/**
+ * 拉取代理状态。档位在请求层覆盖采样参数,所以这里只显示"当前档位",
+ * 不显示具体数值 —— 具体值由代理在每次请求时套用。
+ */
+async function loadProxyStatus() {
+  const r = await window.shell.proxyStatus();
+  if (!r.ok || !r.data) {
+    PROXY = { online: false, port: r.port, error: r.error || `HTTP ${r.status}`, profiles: [], profile: null, compressEnabled: null, lifecycle: r.lifecycle || null };
+    renderProfiles();
+    // 代理掉线后二维码要退回直连地址,所以这里也得重画
+    renderLan();
+    return;
+  }
+  const d = r.data;
+  PROXY = {
+    online: true,
+    port: r.port,
+    profile: d.profile?.current || null,
+    profiles: d.profile?.available || [],
+    compressEnabled: d.compression?.enabled ?? null,
+    profileDetail: d.profile
+      ? `${d.profile.label} · 思考${d.profile.thinking ? '开' : '关'} · 温度 ${d.profile.params?.temperature}`
+      : '',
+    lifecycle: r.lifecycle || null,
+    error: null,
+  };
+  renderProfiles();
+  // 代理上下线会改变二维码该指向哪里,所以状态一变就重画局域网面板
+  renderLan();
+}
+
+/** 按钮上短暂显示一句反馈,然后恢复原文案。 */
+function flash(id, text) {
+  const b = $(id);
+  const old = b.textContent;
+  b.textContent = text;
+  setTimeout(() => { if (b.textContent === text) b.textContent = old; }, 1200);
+}
+
+async function showLogs() {
+  const lines = await window.shell.logs();
+  $('log').textContent = lines.length ? lines.join('\n') : '(暂无日志)';
+  $('logwrap').classList.add('show');
+  $('log').scrollTop = $('log').scrollHeight;
+}
+
+(async function init() {
+  CATALOGUE = await window.shell.catalogue();
+  $('stPort').textContent = CATALOGUE.port;
+  // 预选第一个可用的模型
+  const first = CATALOGUE.models.find((m) => m.present);
+  if (first) { selModel = first.id; selPreset = first.defaultPreset; }
+  selReasoning = loadReasoning();
+  selBudget = loadBudget();
+  selCtx = loadCtx();
+  selKv = loadKv();
+  renderModels(); renderPresets(); renderReasoning(); renderBudgets(); renderKv(); renderCtx(); refreshButtons();
+  applyReasoningVisibility();
+  await loadSettingsToUi();
+  await refresh();
+
+  $('btnStart').onclick = doStart;
+  $('btnStop').onclick = doStop;
+  $('btnSettings').onclick = () => {
+    const box = $('settings');
+    box.classList.toggle('hidden');
+    $('btnSettings').classList.toggle('on', !box.classList.contains('hidden'));
+  };
+  $('optReasoning').onchange = (e) => {
+    saveShowReasoning(e.target.checked);
+    applyReasoningVisibility();
+  };
+
+  // 探针开关。存进主进程的设置(不是 localStorage),因为做决定的是主进程。
+  $('optProbe').onchange = async (e) => {
+    const r = await window.shell.setSettings({ probe: e.target.checked });
+    if (r) SETTINGS.probe = r.probe !== false;
+    $('optProbe').checked = SETTINGS.probe;
+  };
+
+  // 上下文滑块。用 input 而不是 change —— 拖动过程中就要看到读数与警告变化,
+  // 松手才更新的话,用户没法判断什么时候越过了安全线。
+  $('ctxRange').addEventListener('input', (e) => {
+    const steps = ctxStepsFor(currentModel());
+    const v = steps[Number(e.target.value)];
+    if (v) { selCtx = v; saveCtx(); renderCtx(); }
+  });
+
+  // ---- API Key ----
+  $('btnGenKey').onclick = async () => {
+    const r = await window.shell.genKey();
+    SETTINGS.apiKey = r.apiKey;
+    $('inpKey').value = r.apiKey;
+    flash('btnGenKey', '已生成');
+  };
+  $('btnSaveKey').onclick = async () => {
+    const r = await window.shell.setSettings({ apiKey: $('inpKey').value });
+    SETTINGS.apiKey = r.apiKey;
+    $('inpKey').value = r.apiKey;
+    flash('btnSaveKey', '已保存');
+    // Key 改了,正在跑的服务还用着旧的,得重起才生效。
+    const s = await window.shell.status();
+    if (s.running) {
+      $('barText').textContent = 'API Key 已改 · 重启服务后生效';
+    }
+  };
+  $('btnClearKey').onclick = async () => {
+    const r = await window.shell.setSettings({ apiKey: '' });
+    SETTINGS.apiKey = r.apiKey;
+    $('inpKey').value = '';
+    flash('btnClearKey', '已清除');
+  };
+
+  // ---- 局域网 ----
+  $('optLan').onchange = async (e) => {
+    const r = await window.shell.setSettings({ lanMode: e.target.checked });
+    SETTINGS.lanMode = r.lanMode;
+    renderLan();
+    const s = await window.shell.status();
+    if (s.running) $('barText').textContent = '局域网开关已改 · 重启服务后生效';
+  };
+  $('btnRefreshNet').onclick = async () => {
+    await refreshNet();
+    flash('btnRefreshNet', '已刷新');
+  };
+
+  // ---- 自动上下文压缩开关 ----
+  // 它控制的是代理里的行为,不是外壳自己的设置,所以改完要查一下是否真的生效,
+  // 而不是只改本地状态就算完 —— 代理可能已经退出,那样开关其实没写进去。
+  $('optCompress').onchange = async (e) => {
+    const want = e.target.checked;
+    const r = await window.shell.setCompression(want);
+    if (!r.ok) {
+      // 写失败就把勾选框恢复原状,别让它显示一个没生效的状态
+      e.target.checked = !want;
+      $('profileNote').textContent = '设置失败:' + (r.offline ? '代理未在运行' : (r.error || '未知错误'));
+      return;
+    }
+    PROXY.compressEnabled = want;
+    $('profileNote').textContent = want ? '自动压缩已开启' : '自动压缩已关闭';
+  };
+
+  // ---- 代理的起停与防火墙放行 ----
+  $('btnProxyOn').onclick = async () => {
+    const b = $('btnProxyOn');
+    b.disabled = true;
+    b.textContent = '启动中…';
+    const r = await window.shell.startProxy();
+    b.textContent = '启动代理';
+    b.disabled = false;
+    if (!r.ok) $('profileNote').textContent = '启动失败:' + (r.error || '未知错误');
+    await loadProxyStatus();
+  };
+  $('btnProxyOff').onclick = async () => {
+    await window.shell.stopProxy();
+    await loadProxyStatus();
+  };
+  $('btnFw').onclick = async () => {
+    const r = await window.shell.allowFirewall();
+    if (!r.ok) { $('fwText').textContent = '发起授权失败:' + (r.error || '未知错误'); return; }
+    $('fwText').textContent = '已弹出授权窗口。点「是」之后,规则会在几秒内生效 —— 本面板会自动重新检测。';
+    // 提权那个窗口不会回报结果,所以这里轮询自检(查询不需要管理员)。
+    let n = 0;
+    const timer = setInterval(async () => {
+      n++;
+      await loadFirewall();
+      if (!FW.node || FW.node.present || n >= 10) {
+        clearInterval(timer);
+        if (FW.node && FW.node.present) {
+          $('profileNote').textContent = '防火墙已放行 node.exe,手机现在可以连了。';
+        }
+      }
+    }, 2500);
+  };
+
+  $('btnReload').onclick = () => { $('frame').reload(); };  $('btnOpen').onclick = async () => {
+    const s = await window.shell.status();
+    if (s.url) window.open(s.url, '_blank');
+  };
+  $('btnLog').onclick = () => {
+    const w = $('logwrap');
+    w.classList.toggle('show');
+    if (w.classList.contains('show')) showLogs();
+  };
+
+  window.shell.onStateChanged(refresh);
+  initFrameDiagnostics();
+  // 只轮询侧栏状态,这里不碰 webview。
+  setInterval(refresh, 4000);
+
+  // 代理是外壳托管的进程,但它的在线状态仍要定期重查:
+  // 崩了会自动重起,面板不用刷新就能恢复。
+  await loadProxyStatus();
+  await loadFirewall();
+  setInterval(loadProxyStatus, 15000);
+})();
+</script>
+</body>
+</html>

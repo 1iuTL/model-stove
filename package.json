@@ -1,0 +1,22 @@
+{
+  "name": "model-stove",
+  "version": "0.1.0",
+  "description": "Model Stove (模型灶台) — a local-model launcher: a minimal Electron shell that manages llama-server and hosts its built-in Web UI",
+  "main": "src/main.js",
+  "private": true,
+  "keywords": [
+    "llama-server",
+    "llama-cpp",
+    "gguf",
+    "local-llm",
+    "electron",
+    "desktop-app"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^43.4.0"
+  }
+}

@@ -1,0 +1,29 @@
+# dependencies
+node_modules/
+
+# runtime output
+logs/
+*.log
+
+# electron-builder output
+dist/
+out/
+
+# editor / os
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+*.bak
+*.bak-*
+.push-tmp/
+.probe-repo/
+.api-push-cache/
+.api-push-tmp/
+.repro*-tmp/
+.repro-tmp/
+.q2-compare/
+commitmsg.tmp
+.cordis-tmp/
+.proxy-test-tmp/
+*.tmp

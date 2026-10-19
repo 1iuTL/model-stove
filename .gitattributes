@@ -1,0 +1,10 @@
+# 统一换行符。批处理必须是 CRLF —— LF 换行的 .bat/.cmd 在 cmd 下双击不会执行(踩过这个坑)。
+* text=auto
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.sh  text eol=lf
+*.png binary
+*.ico binary
+*.gguf binary
+*.7z binary
