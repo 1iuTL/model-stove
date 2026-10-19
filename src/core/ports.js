@@ -240,12 +240,31 @@ function parseDotNetDate(text) {
 
 const START_TIME_TOLERANCE_MS = 30_000;
 
+/** 台账里的可选正整数（ctx）：缺失/非法/非正数一律 null。 */
+function optionalPositiveInt(value) {
+  if (value == null || value === '') return null;
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+/** 台账里的可选字符串（logFile/kv/reasoning/budget）：空串按缺失处理。 */
+function optionalString(value) {
+  if (value == null) return null;
+  const s = String(value);
+  return s ? s : null;
+}
+
 /**
- * 台账项：{ pid, startedAt, exe, argvHash, port, generation, modelId, preset, lanMode }
+ * 台账项：{ pid, startedAt, exe, argvHash, port, generation, modelId, preset,
+ *          lanMode, logFile, ctx, kv, reasoning, budget }
  *
  * modelId/preset/lanMode 是 P3 热接管新增的：外壳重启后 /health 只能证明
  * “端口上有个活着的服务”，模型是谁、用什么预设、是不是 LAN 模式只能靠台账
  * 记住 —— 否则接管回来界面只能显示一个空壳。
+ *
+ * logFile/ctx/kv/reasoning/budget 是 P3 补齐的：它们只存在于旧外壳的进程句柄
+ * 与 argv 里。热接管后不记台账，日志面板读不到上次输出，界面也说不清当时
+ * 实际用的上下文/KV/思考参数。旧台账没有这些键时按 null 读，语义不变。
  */
 function makeLedgerEntry(fields) {
   return {
@@ -258,6 +277,11 @@ function makeLedgerEntry(fields) {
     modelId: fields.modelId == null ? null : String(fields.modelId),
     preset: fields.preset == null ? null : String(fields.preset),
     lanMode: !!fields.lanMode,
+    logFile: optionalString(fields.logFile),
+    ctx: optionalPositiveInt(fields.ctx),
+    kv: optionalString(fields.kv),
+    reasoning: optionalString(fields.reasoning),
+    budget: optionalString(fields.budget),
   };
 }
 

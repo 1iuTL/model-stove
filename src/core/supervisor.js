@@ -125,6 +125,13 @@ class Supervisor extends EventEmitter {
       generation: h ? h.generation : null,
       argvHash: h ? h.argvHash : null,
       lanMode: h ? !!h.lanMode : false,
+      // P3 补齐：这些是外壳重启后无法从服务本身问出来的运行参数。
+      // spawn 的 handle 里就是当次启动值；adopted 的 handle 从台账还原。
+      logFile: h ? h.logFile || null : null,
+      ctx: h && h.ctx != null ? h.ctx : null,
+      kv: h && h.kv != null ? h.kv : null,
+      reasoning: h && h.reasoning != null ? h.reasoning : null,
+      budget: h && h.budget != null ? h.budget : null,
       // P3 热接管：adopted 表示这个 handle 不是本轮 spawn 的，而是从台账认领的；
       // identity 只有认领来的才有值（strong = 启动时间吻合，weak = 旧台账没有启动时间）。
       adopted: h ? !!h.adopted : false,
@@ -136,9 +143,15 @@ class Supervisor extends EventEmitter {
     return !!handle && !!this.handle && this.handle.generation === handle.generation;
   }
 
-  /** 读某个 handle 的日志尾巴（默认当前）。 */
+  /**
+   * 读某个 handle 的日志尾巴（默认当前）。
+   *
+   * adopted handle 的 logFile 可能来自旧台账（文件还在 → 正常读），也可能
+   * 没有记录或文件已被清理 → 返回空数组。日志面板不该因为"上次的日志没了"
+   * 报错，否则热接管后用户只会看到一个莫名其妙的失败。
+   */
   readLogTail(handle = this.handle, maxLines = 250) {
-    if (!handle) return [];
+    if (!handle || !handle.logFile) return [];
     try {
       const text = this.fs.readFileSync(handle.logFile, 'utf8');
       return text.split(/\r?\n/).filter((l) => l.trim()).slice(-maxLines);
@@ -161,7 +174,13 @@ class Supervisor extends EventEmitter {
    * 成功返回 status()；失败抛 Error（附 code/signal/logTail）。
    */
   async start(params = {}) {
-    const { exe, argsForPort, modelId = null, preset = null, lanMode = false } = params;
+    const {
+      exe, argsForPort, modelId = null, preset = null, lanMode = false,
+      // P3 补齐：运行参数一并进 handle/台账，外壳重启热接管后不再丢成 null。
+      // 调用方传入的是"本次启动的意向值"；非法值仍由 buildArgs 统一回落，
+      // 因此这里只做类型收敛，不重复参数校验。
+      ctx = null, kv = null, reasoning = null, budget = null,
+    } = params;
     const readyTimeoutMs = params.readyTimeoutMs == null ? this.readyTimeoutMs : params.readyTimeoutMs;
 
     if (!exe) throw new Error('start 需要 exe');
@@ -223,6 +242,8 @@ class Supervisor extends EventEmitter {
       }
 
       // 7. 建不可变句柄。之后所有事件都靠 generation 认领。
+      const ctxValue = Number.isInteger(Number(ctx)) && Number(ctx) > 0 ? Number(ctx) : null;
+      const stringOrNull = (v) => (v == null ? null : String(v));
       const handle = Object.freeze({
         pid: child.pid,
         startedAt,
@@ -238,6 +259,11 @@ class Supervisor extends EventEmitter {
         preset,
         // P3：LAN 模式也要进台账 —— 热接管后 main.js 要按它恢复 current。
         lanMode: !!lanMode,
+        // P3 补齐：台账里记住实际请求的运行参数与日志文件，供下次热接管还原。
+        ctx: ctxValue,
+        kv: stringOrNull(kv),
+        reasoning: stringOrNull(reasoning),
+        budget: stringOrNull(budget),
         adopted: false,
       });
       this.handle = handle;
@@ -347,6 +373,10 @@ class Supervisor extends EventEmitter {
         const generation = ++this.generation;
         const startedAt = Number(entry.startedAt) > 0 ? Number(entry.startedAt) : this.now();
         const identity = entry.startedAt ? 'strong' : 'weak';
+        const entryCtx = Number.isInteger(Number(entry.ctx)) && Number(entry.ctx) > 0
+          ? Number(entry.ctx)
+          : null;
+        const entryString = (v) => (v == null ? null : String(v));
         const handle = Object.freeze({
           pid: entry.pid,
           startedAt,
@@ -354,12 +384,18 @@ class Supervisor extends EventEmitter {
           argvHash: entry.argvHash || null,
           port: candidate.port,
           generation,
-          logFile: null,
+          // 日志文件来自旧台账：存在就正常读，不存在时 readLogTail() 返回 []。
+          logFile: entryString(entry.logFile),
           logOffset: 0,
           url: candidate.url,
           modelId: entry.modelId || null,
           preset: entry.preset || null,
           lanMode: !!entry.lanMode,
+          // 旧台账没有这些键 → null（不猜、不报错）。
+          ctx: entryCtx,
+          kv: entryString(entry.kv),
+          reasoning: entryString(entry.reasoning),
+          budget: entryString(entry.budget),
           adopted: true,
           identity,
         });

@@ -551,6 +551,129 @@ test('tryAdopt 之后 stop：kill 被接管的 PID、清台账、回到 idle', a
   assert.deepEqual(ports.readLedger(sup.ledgerFile), []);
 });
 
+// ------------------------------------------- 台账扩展字段与热接管还原（P3 补齐）
+
+test('start：台账写入 logFile/ctx/kv/reasoning/budget，新 Supervisor 接管后 status 还原', async () => {
+  const fake = fakeSpawn();
+  const sup1 = makeSup({ spawn: fake.spawn });
+  await sup1.start(basicParams({
+    preset: 'text-64k',
+    reasoning: 'medium',
+    budget: '32768',
+    ctx: 65536,
+    kv: 'q4_0',
+    lanMode: false,
+  }));
+
+  const ledger1 = ports.readLedger(sup1.ledgerFile);
+  assert.equal(ledger1.length, 1);
+  const entry = ledger1[0];
+  assert.equal(entry.modelId, 'onbit');
+  assert.equal(entry.preset, 'text-64k');
+  assert.equal(entry.logFile, sup1.handle.logFile);
+  assert.equal(entry.ctx, 65536);
+  assert.equal(entry.kv, 'q4_0');
+  assert.equal(entry.reasoning, 'medium');
+  assert.equal(entry.budget, '32768');
+  assert.equal(entry.lanMode, false);
+
+  // 模拟外壳重启：新 Supervisor 读同一份台账，PID/启动时间核对得上 → 接管。
+  const sup2 = makeSup({
+    ledgerFile: sup1.ledgerFile,
+    logDir: sup1.logDir,
+    pidAlive: () => true,
+    processStartTime: () => entry.startedAt,
+    healthCheck: async () => true,
+  });
+  const res = await sup2.tryAdopt();
+  assert.equal(res.adopted, true);
+  assert.equal(res.identity, 'strong');
+
+  const st = sup2.status();
+  assert.equal(st.adopted, true);
+  assert.equal(st.modelId, 'onbit');
+  assert.equal(st.preset, 'text-64k');
+  assert.equal(st.ctx, 65536);
+  assert.equal(st.kv, 'q4_0');
+  assert.equal(st.reasoning, 'medium');
+  assert.equal(st.budget, '32768');
+  assert.equal(st.lanMode, false);
+  assert.equal(st.logFile, sup1.handle.logFile);
+  assert.equal(sup2.handle.logFile, sup1.handle.logFile);
+
+  // 接管后的回写台账仍要带全这些字段，否则下一次重启又会丢。
+  const ledger2 = ports.readLedger(sup1.ledgerFile);
+  assert.equal(ledger2.length, 1);
+  assert.equal(ledger2[0].ctx, 65536);
+  assert.equal(ledger2[0].kv, 'q4_0');
+  assert.equal(ledger2[0].reasoning, 'medium');
+  assert.equal(ledger2[0].budget, '32768');
+  assert.equal(ledger2[0].logFile, sup1.handle.logFile);
+});
+
+test('tryAdopt：旧台账缺 logFile/ctx/kv/reasoning/budget → 不报错，字段为 null', async () => {
+  const sup = makeSup({
+    pidAlive: () => true,
+    processStartTime: () => 5000,
+    healthCheck: async () => true,
+  });
+  // 刻意只写旧格式字段：模拟 P3 之前的台账。
+  ports.writeLedger(sup.ledgerFile, [{
+    pid: 7101,
+    startedAt: 5000,
+    exe: EXE,
+    port: 8234,
+    modelId: 'onbit',
+    preset: 'text-32k',
+    lanMode: true,
+  }]);
+
+  const res = await sup.tryAdopt();
+  assert.equal(res.adopted, true);
+  const st = sup.status();
+  assert.equal(st.logFile, null);
+  assert.equal(st.ctx, null);
+  assert.equal(st.kv, null);
+  assert.equal(st.reasoning, null);
+  assert.equal(st.budget, null);
+  assert.equal(st.lanMode, true);
+  assert.equal(sup.handle.logFile, null);
+  assert.deepEqual(sup.readLogTail(), [], '没有 logFile 时日志为空，不能抛');
+});
+
+test('adopted readLogTail：旧日志存在则读，文件不存在返回空数组', async () => {
+  const dir = tmpDir();
+  const oldLog = path.join(dir, 'server-old.log');
+  fs.writeFileSync(oldLog, 'line-1\nline-2\n\nline-3\n', 'utf8');
+
+  const ledger1 = path.join(dir, 'pids-1.json');
+  ports.writeLedger(ledger1, [adoptEntry({ logFile: oldLog })]);
+  const sup1 = makeSup({
+    ledgerFile: ledger1,
+    pidAlive: () => true,
+    processStartTime: () => 5000,
+    healthCheck: async () => true,
+  });
+  await sup1.tryAdopt();
+  assert.equal(sup1.status().logFile, oldLog);
+  assert.deepEqual(sup1.readLogTail(), ['line-1', 'line-2', 'line-3']);
+
+  // 文件已被清理：返回空数组且不抛（热接管后日志面板不能因此报错）。
+  const missingLog = path.join(dir, 'gone.log');
+  const ledger2 = path.join(dir, 'pids-2.json');
+  ports.writeLedger(ledger2, [adoptEntry({ logFile: missingLog })]);
+  const sup2 = makeSup({
+    ledgerFile: ledger2,
+    pidAlive: () => true,
+    processStartTime: () => 5000,
+    healthCheck: async () => true,
+  });
+  await sup2.tryAdopt();
+  assert.equal(sup2.status().logFile, missingLog);
+  assert.doesNotThrow(() => sup2.readLogTail());
+  assert.deepEqual(sup2.readLogTail(), []);
+});
+
 // ---------------------------------------------------------------- 工具函数
 
 test('defaultMaskArgs：只遮 --api-key 的值', () => {
