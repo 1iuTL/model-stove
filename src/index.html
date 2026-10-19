@@ -1516,6 +1516,27 @@ function deviceTime(ts) {
   return ts ? new Date(ts).toLocaleString() : '—';
 }
 
+/**
+ * 把一次性设备密钥展示到 #deviceOnceBox。
+ *
+ * 签发与轮换共用：key 只在这次响应里出现，不写 localStorage、不 console.log、
+ * 不落任何日志；离开/刷新本页后无法再次查看。
+ */
+function showDeviceKeyOnce(d) {
+  const box = $('deviceOnceBox');
+  box.innerHTML = '';
+  const title = document.createElement('b');
+  title.textContent = '设备密钥（只显示一次）';
+  const line = document.createElement('div');
+  line.textContent = `设备:${d.name || ''}（${d.deviceId || d.id || ''}）`;
+  const tip = document.createElement('div');
+  tip.textContent = '把这串密钥粘贴到手机的 API Key 输入框；离开本页后无法再次查看。';
+  const key = document.createElement('code');
+  key.textContent = d.key || '';
+  box.append(title, line, tip, key);
+  box.classList.remove('hidden');
+}
+
 /** 渲染设备列表。设备名来自用户输入，必须用 textContent，不能拼 innerHTML。 */
 function renderDeviceList() {
   const box = $('deviceList');
@@ -1554,6 +1575,24 @@ function renderDeviceList() {
     row.appendChild(meta);
 
     if (d.revokedAt == null) {
+      // 轮换：生成新 key、旧 key 立即失效；新 key 同样只显示一次。
+      const rot = document.createElement('button');
+      rot.className = 'mini';
+      rot.textContent = '轮换';
+      rot.title = '生成新的设备密钥（旧密钥立即失效）';
+      rot.onclick = async () => {
+        rot.disabled = true;
+        const r = await window.shell.securityRotate(d.id);
+        rot.disabled = false;
+        if (!r.ok) {
+          $('deviceHint').textContent = '轮换失败:' + (r.error || '未知错误');
+          return;
+        }
+        showDeviceKeyOnce(r.data || {});
+        await refreshDevices();
+      };
+      row.appendChild(rot);
+
       const btn = document.createElement('button');
       btn.className = 'mini';
       btn.textContent = '吊销';
@@ -1907,19 +1946,7 @@ async function showLogs() {
       $('deviceHint').textContent = '签发失败:' + (r.error || '未知错误');
       return;
     }
-    const d = r.data || {};
-    const box = $('deviceOnceBox');
-    box.innerHTML = '';
-    const title = document.createElement('b');
-    title.textContent = '设备密钥（只显示一次）';
-    const line = document.createElement('div');
-    line.textContent = `设备:${d.name || ''}（${d.deviceId || ''}）`;
-    const tip = document.createElement('div');
-    tip.textContent = '把这串密钥粘贴到手机的 API Key 输入框；离开本页后无法再次查看。';
-    const key = document.createElement('code');
-    key.textContent = d.key || '';
-    box.append(title, line, tip, key);
-    box.classList.remove('hidden');
+    showDeviceKeyOnce(r.data || {});
     await refreshDevices();
   };
 
