@@ -294,11 +294,59 @@ function buildStartArgs(params = {}) {
   return gated;
 }
 
+/**
+ * 局域网模式的安全前置条件（P1 安全护栏）。
+ *
+ * 为什么必须有：
+ *   - 旧的 LAN 模式只把 llama-server 绑到 0.0.0.0，API Key 是“可选”的。
+ *     没设 Key 时同网段任何人不仅能白嫖模型，还能通过 /slots 看到对话内容
+ *     （/slots 只在 LAN 模式才被 buildArgs 加 --no-slots 关掉）。
+ *   - P1 的能力门控又会把“构建不认识的参数”删掉：如果构建不支持 --api-key，
+ *     gateArgs 会把它悄悄删了 —— 界面以为有鉴权，实际在裸奔。所以这里必须
+ *     在**启动前**用探测结果拒绝，而不是等参数门控静默降级。
+ *
+ * 规则：
+ *   1. lanMode=false → 直接通过（回环模式不需要 Key）。
+ *   2. lanMode=true  → 必须有 API Key。
+ *   3. caps 已知且不支持 --api-key / --no-slots → 拒绝，并说明换构建或退回本机模式。
+ *   4. caps 未知（探测失败）→ 不额外阻断（沿用兼容模式策略），只要求 Key 存在。
+ */
+function assertLanSafety({ lanMode, apiKey, caps } = {}) {
+  if (!lanMode) return { ok: true };
+
+  const key = String(apiKey || '').trim();
+  if (!key) {
+    throw new Error(
+      '局域网模式需要先设置 API Key。\n'
+      + '没有 Key 时，同一网络里的任何人都能直接使用你的模型，并可能通过 /slots 看到对话内容。\n'
+      + '请先在「设置」里生成 API Key，或保持仅本机模式。',
+    );
+  }
+
+  if (caps && caps.ok === true) {
+    if (!capsModule.supports(caps, '--api-key')) {
+      throw new Error(
+        '这个 llama-server 构建不支持 --api-key，无法在局域网模式下鉴权。\n'
+        + '请换用官方/更新的构建，或保持仅本机模式。',
+      );
+    }
+    if (!capsModule.supports(caps, '--no-slots')) {
+      throw new Error(
+        '这个 llama-server 构建不支持 --no-slots，局域网下会暴露对话槽位（/slots）。\n'
+        + '请换用官方/更新的构建，或保持仅本机模式。',
+      );
+    }
+  }
+
+  return { ok: true };
+}
+
 module.exports = {
   VALUE_FLAGS,
   gateArgs,
   classifyStartupError,
   planRetry,
   buildStartArgs,
+  assertLanSafety,
   formatDropped,
 };

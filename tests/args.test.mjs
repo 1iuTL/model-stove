@@ -373,3 +373,53 @@ test('参数顺序不变：门控只删除、不重排', () => {
   }
   assert.ok(kept.length >= gated.args.length);
 });
+
+// ------------------------------------------- P1 安全护栏：局域网模式必须有鉴权
+
+function capsWith(...flags) {
+  return { ok: true, flags: new Set(flags) };
+}
+
+test('assertLanSafety：回环模式不需要 Key', () => {
+  assert.deepEqual(
+    argsMod.assertLanSafety({ lanMode: false, apiKey: '', caps: capsWith() }),
+    { ok: true },
+  );
+});
+
+test('assertLanSafety：局域网模式没有 Key 必须拒绝', () => {
+  assert.throws(
+    () => argsMod.assertLanSafety({ lanMode: true, apiKey: '', caps: capsWith('--api-key', '--no-slots') }),
+    /API Key/,
+  );
+  // 纯空白也当没设置
+  assert.throws(
+    () => argsMod.assertLanSafety({ lanMode: true, apiKey: '   ', caps: null }),
+    /API Key/,
+  );
+});
+
+test('assertLanSafety：构建不支持 --api-key 时拒绝 LAN（否则等于裸奔）', () => {
+  assert.throws(
+    () => argsMod.assertLanSafety({ lanMode: true, apiKey: 'k', caps: capsWith('--no-slots') }),
+    /不支持 --api-key/,
+  );
+});
+
+test('assertLanSafety：构建不支持 --no-slots 时拒绝 LAN（防对话槽位泄露）', () => {
+  assert.throws(
+    () => argsMod.assertLanSafety({ lanMode: true, apiKey: 'k', caps: capsWith('--api-key') }),
+    /不支持 --no-slots/,
+  );
+});
+
+test('assertLanSafety：caps 未知时只要求 Key（兼容模式不额外阻断）', () => {
+  assert.deepEqual(
+    argsMod.assertLanSafety({ lanMode: true, apiKey: 'k', caps: null }),
+    { ok: true },
+  );
+  assert.deepEqual(
+    argsMod.assertLanSafety({ lanMode: true, apiKey: 'k', caps: { ok: false, error: 'probe failed' } }),
+    { ok: true },
+  );
+});

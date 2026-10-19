@@ -24,7 +24,7 @@ const { createPaths, ensureDirs } = require('./core/paths');
 const { Supervisor } = require('./core/supervisor');
 const ports = require('./core/ports');
 const { loadCapabilities } = require('./core/capabilities');
-const { buildStartArgs, gateArgs, classifyStartupError, planRetry } = require('./core/args');
+const { buildStartArgs, gateArgs, classifyStartupError, planRetry, assertLanSafety } = require('./core/args');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const PROXY_SCRIPT = path.join(REPO_ROOT, 'context-proxy.mjs');
@@ -399,6 +399,10 @@ async function startServer(modelId, presetKey, reasoningKey, lanMode, budgetKey,
     appendShellLog('[shell] 构建能力探测失败（兼容模式：参数照旧发送）: '
       + `${caps && caps.error ? caps.error : '未知错误'}`);
   }
+
+  // P1 安全护栏：局域网模式必须有 API Key；构建不支持 --api-key/--no-slots 时拒绝。
+  // 不能等 gateArgs 把不支持的参数删掉 —— 那会变成“界面以为有鉴权、实际裸奔”。
+  assertLanSafety({ lanMode, apiKey, caps });
 
   let spawnedArgs = null;
   const sup = ensureSupervisor();
