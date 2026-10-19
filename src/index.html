@@ -445,7 +445,10 @@
   </div>
 
   <div id="stage">
-    <webview id="frame" class="hidden" src="about:blank" allowpopups></webview>
+    <!-- 不放开弹窗：聊天页面里的链接/广告不该自己弹新窗口。
+         main.js 另外用 setWindowOpenHandler 拒绝所有弹窗，并只允许
+         停留在当前 llama-server 的源上。 -->
+    <webview id="frame" class="hidden" src="about:blank"></webview>
     <div id="placeholder">
       <div class="big">◍</div>
       <div>左侧选一个模型和预设,然后点「启动」</div>
@@ -484,6 +487,8 @@ let loadedUrl = null;
 let frameFailed = false;
 // 服务是否在跑。局域网面板要用它决定是否提示"先点启动"。
 let SERVICE_RUNNING = false;
+// 运行中的真实端口（动态分配，不能再用 CATALOGUE.port 当直连地址）。
+let SERVICE_PORT = null;
 
 const REASONING_STORE_KEY = 'model-stove.reasoning';
 const SHOW_REASONING_KEY = 'model-stove.showReasoning';
@@ -920,6 +925,9 @@ async function refresh() {
   const s = await window.shell.status();
   const wasRunning = SERVICE_RUNNING;
   SERVICE_RUNNING = !!s.running;
+  SERVICE_PORT = s.port || null;
+  // 端口一行跟着真实端口走（启动前显示 —，别显示一个会被当成"正在监听"的数字）
+  $('stPort').textContent = SERVICE_PORT || '—';
   // 状态变化时重画局域网面板 —— 那句"服务未运行"的提示要能自己消失。
   if (wasRunning !== SERVICE_RUNNING) {
     renderLan();
@@ -934,7 +942,7 @@ async function refresh() {
     // 所以这里要把这件事说清楚,而不是显示成一切正常。
     if (s.external) {
       setDot('busy', '运行中(外部)');
-      $('barText').textContent = `8091 上有服务在跑,但不是本外壳启动的 · 点「停止」会一并收掉它`;
+      $('barText').textContent = `${s.port || ''} 上有服务在跑,但不是本外壳启动的 · 点「停止」会一并收掉它`;
     } else {
       setDot('on', '运行中');
       $('barText').textContent = `${s.modelName || ''} · ${s.preset || ''}` +
@@ -1056,11 +1064,11 @@ async function doStop() {
   // 给一句明确反馈。尤其是"停掉了外部进程"这种情况 —— 用户按停止时
   // 未必知道 8091 上那个不是本外壳起的,不说清楚会以为是按坏了。
   if (r && r.adopted) {
-    $('barText').textContent = `已停止 8091 上的服务(它不是本外壳启动的)`;
+    $('barText').textContent = `已停止上次端口上的服务(它不是本外壳启动的)`;
   } else if (r && r.stopped && r.stopped.length) {
     $('barText').textContent = '已停止';
   } else if (SERVICE_RUNNING) {
-    $('barText').textContent = '停止失败:8091 上仍然有服务在应答,看日志';
+    $('barText').textContent = '停止失败:服务仍然在应答,看日志';
   }
 }
 
@@ -1130,7 +1138,11 @@ function renderLan() {
   // 之前这里固定用 list[0].url(即 llama-server 端口),结果是二维码把你带到
   // 一个档位完全不起作用的地址,而面板又显示「代理未运行」,两处互相打架。
   const first = list[0];
-  if (PROXY.online) {
+  // 代理默认只绑 127.0.0.1；只有"局域网模式 + 已设 API Key"时主进程才允许
+  // 它绑 0.0.0.0。所以"代理在线"不等于"手机连得上" —— 二维码必须按绑定状态选，
+  // 否则会把手机带到一个它根本连不到的端口。外部代理无法确认绑定，按可用处理。
+  const proxyOnLan = !!(PROXY.online && (PROXY.allowLan || (PROXY.lifecycle && PROXY.lifecycle.external)));
+  if (proxyOnLan) {
     const proxyUrl = `http://${first.address}:${PROXY.port}/`;
     renderQr(proxyUrl, '带档位与压缩');
 
@@ -1145,12 +1157,14 @@ function renderLan() {
     // 把直连地址也列出来,并标明差异:两者是不同来源,聊天记录各自独立
     const alt = document.createElement('div');
     alt.className = 'note';
-    alt.textContent = `若要绕过代理直连模型,把地址换成 :${CATALOGUE.port} 端口即可 —— 那样不带档位与压缩,且聊天记录是另一套(浏览器按地址隔离存储)。`;
+    alt.textContent = `若要绕过代理直连模型,把地址换成 :${SERVICE_PORT || CATALOGUE.port} 端口即可 —— 那样不带档位与压缩,且聊天记录是另一套(浏览器按地址隔离存储)。注意端口是每次动态分配的,以当前状态栏为准。`;
     box.appendChild(alt);
   } else {
     const warn = document.createElement('div');
     warn.className = 'warn';
-    warn.textContent = `代理当前没有运行,二维码指向的是直连地址 :${CATALOGUE.port} —— 任务档位与自动压缩在那里不生效。建议先在「任务档位」里点「启动代理」。`;
+    warn.textContent = PROXY.online
+      ? `代理已启动,但为了安全只监听 127.0.0.1(需要先勾选「允许其它设备连接」并设置 API Key)。二维码已退回直连地址 :${SERVICE_PORT || CATALOGUE.port} —— 档位与自动压缩在那里不生效。`
+      : `代理当前没有运行,二维码指向的是直连地址 :${SERVICE_PORT || CATALOGUE.port} —— 任务档位与自动压缩在那里不生效。建议先在「任务档位」里点「启动代理」。`;
     box.appendChild(warn);
     renderQr(first.url, '直连 · 无档位');
   }
@@ -1198,7 +1212,7 @@ async function refreshNet() {
  * 代理状态。代理是独立进程,没启动时下面所有操作都不可用 ——
  * 所以必须区分"没在跑"和"出错了",否则用户只会看到按钮没反应。
  */
-let PROXY = { online: false, profile: null, profiles: [], compressEnabled: null, error: null };
+let PROXY = { online: false, allowLan: false, profile: null, profiles: [], compressEnabled: null, error: null };
 
 /**
  * 防火墙自检结果。
@@ -1338,7 +1352,7 @@ async function chooseProfile(key) {
 async function loadProxyStatus() {
   const r = await window.shell.proxyStatus();
   if (!r.ok || !r.data) {
-    PROXY = { online: false, port: r.port, error: r.error || `HTTP ${r.status}`, profiles: [], profile: null, compressEnabled: null, lifecycle: r.lifecycle || null };
+    PROXY = { online: false, allowLan: false, port: r.port, error: r.error || `HTTP ${r.status}`, profiles: [], profile: null, compressEnabled: null, lifecycle: r.lifecycle || null };
     renderProfiles();
     // 代理掉线后二维码要退回直连地址,所以这里也得重画
     renderLan();
@@ -1347,6 +1361,7 @@ async function loadProxyStatus() {
   const d = r.data;
   PROXY = {
     online: true,
+    allowLan: !!(r.lifecycle && r.lifecycle.allowLan),
     port: r.port,
     profile: d.profile?.current || null,
     profiles: d.profile?.available || [],
@@ -1379,7 +1394,8 @@ async function showLogs() {
 
 (async function init() {
   CATALOGUE = await window.shell.catalogue();
-  $('stPort').textContent = CATALOGUE.port;
+  // 端口是启动时才由 Supervisor 选的，这里先不显示一个假数字。
+  $('stPort').textContent = '—';
   // 预选第一个可用的模型
   const first = CATALOGUE.models.find((m) => m.present);
   if (first) { selModel = first.id; selPreset = first.defaultPreset; }

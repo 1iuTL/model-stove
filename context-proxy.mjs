@@ -14,10 +14,16 @@
 // 存储**,手机上原有的历史会话不会出现在新地址下(没有丢,只是不在那儿)。
 //
 // 用法:node context-proxy.mjs
-//   PROXY_PORT   本代理端口,默认 8092
-//   UPSTREAM     上游地址,默认 http://127.0.0.1:8091
-//   COMPRESS=0   启动时关闭压缩(也可用 _bridge 接口在运行时切换)
+//   PROXY_PORT      本代理端口,默认 8092
+//   PROXY_TARGET    上游地址,默认 http://127.0.0.1:8091（llama 端口是动态的，
+//                   由外壳通过这个变量传进来；UPSTREAM 是旧名字，仍兼容）
+//   PROXY_ALLOW_LAN=1  显式允许绑定 0.0.0.0（由外壳在 LAN 模式 + 已设 API Key 时传）
+//   PROXY_TOKEN     /_bridge 的会话 token；设置后所有 _bridge 请求必须带上
+//   UPSTREAM_KEY    上游开了 --api-key 时，代理自己发起的请求要带它
+//   COMPRESS=0      启动时关闭压缩(也可用 _bridge 接口在运行时切换)
 import http from 'node:http'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { appendFileSync, mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { injectPanel, PANEL_JS, PANEL_SCRIPT_PATH } from './ui-inject.mjs'
@@ -30,7 +36,27 @@ const { profiles: PROFILES, defaultProfile, resolve: resolveProfile } = require(
 // ------------------------------------------------------------------ 配置
 
 const PROXY_PORT = Number(process.env.PROXY_PORT || 8092)
-const UPSTREAM = process.env.UPSTREAM || 'http://127.0.0.1:8091'
+
+// ---- P0 安全默认 ----
+//
+// 绑定地址：以前恒为 0.0.0.0 —— 只要代理在跑，同网段任何人都能直接访问
+// /_bridge（切档位、开关压缩）以及转发后的模型接口。现在默认只绑回环；
+// 只有外壳在"用户明确开了局域网 + 已经设了 API Key"时才传 PROXY_ALLOW_LAN=1。
+// 这里仍显式要求 1，避免 *任意* 环境变量值（比如 "true"）被误解成放行。
+const PROXY_HOST = process.env.PROXY_ALLOW_LAN === '1' ? '0.0.0.0' : '127.0.0.1'
+
+// 上游（llama-server）地址。端口是动态的，外壳通过 PROXY_TARGET 传；
+// 默认沿用 8091 只是为了让"手工 node context-proxy.mjs"仍然能用。
+const UPSTREAM = (process.env.PROXY_TARGET || process.env.UPSTREAM || 'http://127.0.0.1:8091').replace(/\/+$/, '')
+
+// /_bridge 会话 token。空 = 不鉴权（本地开发/旧测试兼容）。
+const BRIDGE_TOKEN = String(process.env.PROXY_TOKEN || '').trim()
+
+// 请求体上限：8 MiB。模型的图片/长文本请求也够用；再大基本是误发或攻击。
+const MAX_BODY_BYTES = Number(process.env.PROXY_MAX_BODY_BYTES || 8 * 1024 * 1024)
+// 上游空闲超时：连接/等响应头/两个数据块之间，任一超过这个时间就 504。
+// 默认 120 秒；测试可以用 PROXY_IDLE_TIMEOUT_MS 调小。
+const IDLE_TIMEOUT_MS = Number(process.env.PROXY_IDLE_TIMEOUT_MS || 120000)
 // ⚠ 2026-09-30:上游开了 --api-key 时,代理**自己发起的**请求也必须带 key。
 //   以前只有"转发客户端请求"那条路带(那条原样透传客户端 headers),而代理自己发的
 //   两类请求 —— ① 读 /props 拿 n_ctx  ② 压缩时调 chat/completions —— 都是裸请求,
@@ -53,10 +79,10 @@ const UPSTREAM_URL = new URL(UPSTREAM)
 // 界面显示压缩阈值 0.2,而代码默认是 0.6,查了半天才发现是测试干的。
 //
 // 测试必须能把状态写到别处,不能有"跑个测试顺手改了用户配置"这种事。
-const LOG_DIR = process.env.PROXY_STATE_DIR || 'C:\\deepseek harness\\model-stove\\logs'
+const LOG_DIR = process.env.PROXY_STATE_DIR || fileURLToPath(new URL('./logs', import.meta.url))
 if (!existsSync(LOG_DIR)) mkdirSync(LOG_DIR, { recursive: true })
-const LOG_FILE = `${LOG_DIR}\\context-proxy.log`
-const STATE_FILE = `${LOG_DIR}\\context-proxy-state.json`
+const LOG_FILE = path.join(LOG_DIR, 'context-proxy.log')
+const STATE_FILE = path.join(LOG_DIR, 'context-proxy-state.json')
 
 function log(...args) {
   const line = `[${new Date().toISOString()}] ${args.join(' ')}`
@@ -296,8 +322,13 @@ async function maybeCompress(messages) {
 
 // ------------------------------------------------------------------ 请求转发
 
-/** 把上游响应回给客户端(支持流式)。 */
-async function pipeResponse(upstreamRes, res) {
+/**
+ * 把上游响应回给客户端(支持流式)。
+ *
+ * watchdog 由 forward() 创建，负责"上游空闲超时"：每收到一块数据就重新计时，
+ * 超时后 abort 上游 fetch，这里收敛成 504（还没发响应头时）。
+ */
+async function pipeResponse(upstreamRes, res, watchdog) {
   const headers = {}
   for (const [k, v] of upstreamRes.headers) {
     // 去掉会与实际内容不符的头:长度可能变了,编码也已由 fetch 解开
@@ -305,65 +336,178 @@ async function pipeResponse(upstreamRes, res) {
     headers[k] = v
   }
 
-  // ---- HTML 响应:注入档位面板 ----
-  //
-  // 为什么要在这一层做:llama.cpp 的 Web UI 是预压缩的 Svelte 包,改它要反编译
-  // 重建,而且一升级就白改;代理夹在中间,在返回 HTML 时追加一段自己的脚本最省事。
-  //
-  // 注入之后 content-length 必然变化,所以上面统一丢掉了它,由 Node 用 chunked
-  // 重新计算 —— 这也是"无论如何都不转发 content-length"的原因(编解码后它的
-  // 长度本来就不可信)。
-  const ctype = String(upstreamRes.headers.get('content-type') || '')
-  const isHtml = ctype.includes('text/html')
-  if (isHtml && upstreamRes.body) {
-    // HTML 是我们改写过的,必须禁止缓存。
+  try {
+    // ---- HTML 响应:注入档位面板 ----
     //
-    // 为什么:上游给的是 no-cache + ETag,而正文已经被我们改过,ETag 不再
-    // 对应实际内容。实测后果是手机上一直拿到旧版本的页面 —— 面板改了也看不到,
-    // 看起来像"改动没生效"。
-    headers['cache-control'] = 'no-store, must-revalidate'
-    let html
-    try {
-      html = await upstreamRes.text()
-    } catch {
-      // 读失败就退回流式,不让注入影响可用性
+    // 为什么要在这一层做:llama.cpp 的 Web UI 是预压缩的 Svelte 包,改它要反编译
+    // 重建,而且一升级就白改;代理夹在中间,在返回 HTML 时追加一段自己的脚本最省事。
+    //
+    // 注入之后 content-length 必然变化,所以上面统一丢掉了它,由 Node 用 chunked
+    // 重新计算 —— 这也是"无论如何都不转发 content-length"的原因(编解码后它的
+    // 长度本来就不可信)。
+    const ctype = String(upstreamRes.headers.get('content-type') || '')
+    const isHtml = ctype.includes('text/html')
+    if (isHtml && upstreamRes.body) {
+      // HTML 是我们改写过的,必须禁止缓存。
+      //
+      // 为什么:上游给的是 no-cache + ETag,而正文已经被我们改过,ETag 不再
+      // 对应实际内容。实测后果是手机上一直拿到旧版本的页面 —— 面板改了也看不到,
+      // 看起来像"改动没生效"。
+      headers['cache-control'] = 'no-store, must-revalidate'
+      let html
+      try {
+        html = await upstreamRes.text()
+      } catch {
+        // 读失败就退回流式,不让注入影响可用性
+        res.writeHead(upstreamRes.status, headers)
+        res.end()
+        return
+      }
+      watchdog && watchdog.disarm()
+      if (html.includes('id="stove-panel"')) {
+        // 已经注入过(理论上不该发生,HTML 只回一次);原样返回,避免叠加两份。
+        res.writeHead(upstreamRes.status, headers)
+        res.end(html)
+        return
+      }
       res.writeHead(upstreamRes.status, headers)
-      res.end()
+      // token 只注入到 HTML：面板脚本会把它放进 /_bridge 请求头。
+      res.end(injectPanel(html, { token: BRIDGE_TOKEN }))
       return
     }
-    if (html.includes('id="stove-panel"')) {
-      // 已经注入过(理论上不该发生,HTML 只回一次);原样返回,避免叠加两份。
-      res.writeHead(upstreamRes.status, headers)
-      res.end(html)
-      return
-    }
-    res.writeHead(upstreamRes.status, headers)
-    res.end(injectPanel(html))
-    return
-  }
 
-  res.writeHead(upstreamRes.status, headers)
-  if (!upstreamRes.body) { res.end(); return }
-  const reader = upstreamRes.body.getReader()
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    res.write(Buffer.from(value))
+    res.writeHead(upstreamRes.status, headers)
+    if (!upstreamRes.body) { res.end(); return }
+    const reader = upstreamRes.body.getReader()
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      watchdog && watchdog.arm()
+      res.write(Buffer.from(value))
+    }
+    res.end()
+  } catch (e) {
+    // 上游中途断掉 / 空闲超时：响应头还没发就回 504/502，否则只能断开。
+    const timedOut = !!(watchdog && watchdog.timedOut())
+    log(`上游响应中断${timedOut ? '(空闲超时)' : ''}: ${e.message}`)
+    if (!res.headersSent) {
+      sendJson(res, timedOut ? 504 : 502, {
+        error: { message: timedOut ? '上游空闲超时' : '上游响应中断', type: timedOut ? 'upstream_timeout' : 'upstream_error' },
+      })
+    } else {
+      try { res.destroy() } catch { /* 已经断了 */ }
+    }
+  } finally {
+    watchdog && watchdog.disarm()
   }
-  res.end()
 }
 
-/** 读取请求体。 */
-function readBody(req) {
+/** 统一的 JSON 响应（401 不泄露细节）。 */
+function sendJson(res, status, payload, extraHeaders) {
+  if (res.headersSent) return
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...(extraHeaders || {}) })
+  res.end(JSON.stringify(payload))
+}
+
+/**
+ * 统一的 401。
+ *
+ * 刻意只有 ok/error 两个字段：不回显期望的 header 名、不回显 token 前缀、
+ * 也不说明"是头缺失还是值不匹配"。攻击者拿不到任何可用于区分的线索。
+ */
+function sendUnauthorized(res) {
+  sendJson(res, 401, { ok: false, error: 'unauthorized' })
+}
+
+/** 常数时间比较，避免按字节提前返回。 */
+function tokenEquals(a, b) {
+  const x = Buffer.from(String(a || ''), 'utf8')
+  const y = Buffer.from(String(b || ''), 'utf8')
+  if (x.length !== y.length) return false
+  let diff = 0
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i]
+  return diff === 0
+}
+
+/** /_bridge 鉴权：未设置 token 时保持旧行为（免鉴权）。 */
+function bridgeAuthorized(req) {
+  if (!BRIDGE_TOKEN) return true
+  const header = String(req.headers['x-bridge-token'] || '')
+  const auth = String(req.headers.authorization || '')
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : ''
+  return tokenEquals(header, BRIDGE_TOKEN) || tokenEquals(bearer, BRIDGE_TOKEN)
+}
+
+/**
+ * 读取请求体，超过上限立即拒绝（code = BODY_TOO_LARGE）。
+ *
+ * 不在 reject 里直接 destroy socket：调用方还要把 413 写回去。继续消费剩余的
+ * 数据只会被丢弃，不会进内存 —— 上限的意义就是不让 9 MiB 变成 900 MiB。
+ */
+function readBody(req, limit = MAX_BODY_BYTES) {
   return new Promise((resolve, reject) => {
     const chunks = []
-    req.on('data', (c) => chunks.push(c))
-    req.on('end', () => resolve(Buffer.concat(chunks)))
-    req.on('error', reject)
+    let size = 0
+    let tooLarge = false
+    req.on('data', (c) => {
+      if (tooLarge) return
+      size += c.length
+      if (size > limit) {
+        tooLarge = true
+        chunks.length = 0
+        const err = new Error(`请求体超过 ${limit} 字节上限`)
+        err.code = 'BODY_TOO_LARGE'
+        reject(err)
+        return
+      }
+      chunks.push(c)
+    })
+    req.on('end', () => { if (!tooLarge) resolve(Buffer.concat(chunks)) })
+    req.on('error', (e) => { if (!tooLarge) reject(e) })
   })
 }
 
 const server = http.createServer(async (req, res) => {
+  try {
+    await handleRequest(req, res)
+  } catch (e) {
+    // 请求体超限：在还没有转发之前就拒绝，并让剩余字节自然被丢弃。
+    if (e && e.code === 'BODY_TOO_LARGE') {
+      log(`拒绝过大的请求体: ${req.method} ${req.url}`)
+      if (!res.headersSent) {
+        sendJson(res, 413, { error: { message: 'request body too large', type: 'payload_too_large' } })
+      } else {
+        try { res.destroy() } catch {}
+      }
+      try { req.resume() } catch {}
+      return
+    }
+    log(`处理请求异常 ${req.method} ${req.url}: ${e && e.message}`)
+    if (!res.headersSent) {
+      sendJson(res, 500, { error: { message: 'internal error' } })
+    } else {
+      try { res.destroy() } catch {}
+    }
+  }
+})
+
+async function handleRequest(req, res) {
+  // /slots 与 /metrics 在代理层常关。
+  //
+  // 为什么不给 llama 加 --no-slots：argv 必须逐字节保持不变（90 例快照），
+  // 而且 /slots 只在"绑到局域网"时才是泄露面；代理层统一 404 既不动 argv，
+  // 也覆盖了所有访问路径（包括手机走 :8092 的情况）。
+  const urlPath = String(req.url || '').split('?')[0]
+  if (urlPath === '/slots' || urlPath === '/metrics') {
+    sendJson(res, 404, { error: { message: 'not found' } })
+    return
+  }
+
+  // /_bridge/* 统一鉴权（token 未设置时保持免鉴权，兼容本地开发/旧测试）。
+  if (urlPath === '/_bridge' || urlPath.startsWith('/_bridge/')) {
+    if (!bridgeAuthorized(req)) { sendUnauthorized(res); return }
+  }
+
   // ---- 面板脚本(外链资源)----
   //
   // 单独一个路径而不是内联进 HTML,原因见 ui-inject.mjs 的说明:
@@ -445,6 +589,8 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' })
         res.end(JSON.stringify({ ok: true, profile: state.profile, compression: { enabled: state.enabled, thresholdRatio: state.thresholdRatio, keepRecentTurns: state.keepRecentTurns } }))
       } catch (e) {
+        // 请求体超限必须交给最外层统一回 413，不能被这里吞成 400。
+        if (e && e.code === 'BODY_TOO_LARGE') throw e
         res.writeHead(400, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ ok: false, error: e.message }))
       }
@@ -462,6 +608,7 @@ const server = http.createServer(async (req, res) => {
     try {
       body = JSON.parse((await readBody(req)).toString('utf8') || '{}')
     } catch (e) {
+      if (e && e.code === 'BODY_TOO_LARGE') throw e
       res.writeHead(400, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: { message: 'invalid JSON' } }))
       return
@@ -526,18 +673,24 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    const upstreamRes = await forward(JSON.stringify(body), req, res)
-    if (upstreamRes) await pipeResponse(upstreamRes, res)
+    const out = await forward(JSON.stringify(body), req, res)
+    if (out) await pipeResponse(out.upstreamRes, res, out.watchdog)
     return
   }
 
   // ---- 其余一律透明转发 ----
   const buf = ['GET', 'HEAD'].includes(req.method) ? undefined : await readBody(req)
-  const upstreamRes = await forward(buf, req, res)
-  if (upstreamRes) await pipeResponse(upstreamRes, res)
-})
+  const out = await forward(buf, req, res)
+  if (out) await pipeResponse(out.upstreamRes, res, out.watchdog)
+}
 
-/** 向发上游发一次请求。出错时直接给客户端一个 502。 */
+/**
+ * 向发上游发一次请求。
+ *
+ * 超时模型：空闲超时，而不是总时长。模型首 token 可能要几十秒，不能按总时长
+ * 砍掉；但从连上、到响应头、再到每一块数据之间，只要 120 秒没有任何进展，
+ * 就 abort 并回 504。watchdog 交给 pipeResponse 在流式读取时续期。
+ */
 async function forward(buf, req, res) {
   const headers = {}
   for (const [k, v] of Object.entries(req.headers)) {
@@ -547,29 +700,60 @@ async function forward(buf, req, res) {
   headers.host = UPSTREAM_URL.host
   if (buf) headers['content-length'] = String(Buffer.byteLength(buf))
 
+  const controller = new AbortController()
+  let timedOut = false
+  let timer = null
+  const arm = () => {
+    if (IDLE_TIMEOUT_MS <= 0) return
+    clearTimeout(timer)
+    timer = setTimeout(() => {
+      timedOut = true
+      try { controller.abort() } catch { /* 已经结束 */ }
+    }, IDLE_TIMEOUT_MS)
+    // 不拦住进程退出
+    if (timer.unref) timer.unref()
+  }
+  const disarm = () => { clearTimeout(timer); timer = null }
+  arm()
+
   try {
-    return await fetch(`${UPSTREAM}${req.url}`, {
+    const upstreamRes = await fetch(`${UPSTREAM}${req.url}`, {
       method: req.method,
       headers,
       body: buf,
-      // 模型推理可能很久,不设总超时;连接阶段有默认保护
-      signal: AbortSignal.timeout(600000),
+      signal: controller.signal,
     })
+    // 已拿到响应头，接下来由 pipeResponse 每块数据续期。
+    arm()
+    return { upstreamRes, watchdog: { arm, disarm, timedOut: () => timedOut } }
   } catch (e) {
+    disarm()
     const msg = e.cause ? (e.cause.code || e.cause.message) : e.message
+    if (timedOut) {
+      log(`上游空闲超时 ${req.method} ${req.url} (${IDLE_TIMEOUT_MS}ms)`)
+      if (!res.headersSent) {
+        sendJson(res, 504, { error: { message: '上游空闲超时', type: 'upstream_timeout' } })
+      }
+      return null
+    }
     log(`转发失败 ${req.method} ${req.url}: ${msg}`)
     if (!res.headersSent) {
-      res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' })
-      res.end(JSON.stringify({ error: { message: `连不上上游 ${UPSTREAM}:${msg}`, type: 'upstream_unreachable' } }))
+      sendJson(res, 502, {
+        error: { message: `连不上上游 ${UPSTREAM}:${msg}`, type: 'upstream_unreachable' },
+      })
     }
     return null
   }
 }
 
-server.listen(PROXY_PORT, '0.0.0.0', () => {
+server.listen(PROXY_PORT, PROXY_HOST, () => {
+  const lan = PROXY_HOST === '0.0.0.0'
   log('=== 上下文压缩代理已启动 ===')
-  log(`  监听: http://0.0.0.0:${PROXY_PORT}  (手机连这个)`)
+  // 如实打印绑定地址：这是"手机能不能连"最直接的证据，不能只写一个理想值。
+  log(`  监听: http://${PROXY_HOST}:${PROXY_PORT}  ${lan ? '(局域网可访问)' : '(仅本机回环)'}`)
   log(`  上游: ${UPSTREAM}`)
+  log(`  /_bridge: ${BRIDGE_TOKEN ? '已启用会话 token' : '未鉴权(未设置 PROXY_TOKEN)'}`)
+  log(`  请求体上限: ${Math.round(MAX_BODY_BYTES / 1024 / 1024)} MiB  上游空闲超时: ${IDLE_TIMEOUT_MS}ms`)
   log(`  压缩: ${state.enabled ? '开启' : '关闭'}  阈值: 上下文的 ${state.thresholdRatio}`)
   log(`  保留最近 ${state.keepRecentTurns} 轮原文`)
   log(`  状态/开关: GET|POST http://127.0.0.1:${PROXY_PORT}/_bridge/status`)

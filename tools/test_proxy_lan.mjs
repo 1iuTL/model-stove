@@ -1,4 +1,7 @@
-// 验证:代理是否监听在 0.0.0.0,也就是手机(走局域网地址)能否连上。
+// 验证:**显式开启 LAN 模式时**代理是否监听在 0.0.0.0，也就是手机能否连上。
+//
+// P0 之后代理默认只绑 127.0.0.1；只有外壳在"用户开了局域网 + 设了 API Key"
+// 时传 PROXY_ALLOW_LAN=1。本测试直接模拟后一种情况。
 //
 // 为什么单独测这一条:二维码现在指向代理端口,如果代理只监听 127.0.0.1,
 // 手机扫码会连不上 —— 那就是把一个"功能少但能用"的地址换成了"完全用不了"的
@@ -7,18 +10,22 @@ import { spawn } from 'node:child_process'
 import { openSync, closeSync, mkdirSync, rmSync } from 'node:fs'
 import { setTimeout as sleep } from 'node:timers/promises'
 import os from 'node:os'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const APP = 'C:\\deepseek harness\\model-stove'
-const TMP = `${APP}\\.proxy-lan`
+const APP = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+const TMP = path.join(APP, '.proxy-lan')
 rmSync(TMP, { recursive: true, force: true })
 mkdirSync(TMP, { recursive: true })
 
 const PORT = 8093
 
-const out = openSync(`${TMP}\\proxy.log`, 'w')
-const proxy = spawn(process.execPath, [`${APP}\\context-proxy.mjs`], {
+const out = openSync(path.join(TMP, 'proxy.log'), 'w')
+const proxy = spawn(process.execPath, [path.join(APP, 'context-proxy.mjs')], {
   cwd: APP,
   env: { ...process.env, PROXY_PORT: String(PORT) ,
+    // 显式允许绑 0.0.0.0（P0 之前这是默认值）
+    PROXY_ALLOW_LAN: '1',
     // 状态写到测试自己的临时目录,别碰生产的 context-proxy-state.json
     PROXY_STATE_DIR: TMP},
   stdio: ['ignore', out, out],

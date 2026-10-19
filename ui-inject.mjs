@@ -24,7 +24,7 @@
 //   - **拖动改成拖标题栏**(面板里那行「任务档位」),而不是拖按钮本身
 //   - 面板用 <details> 实现开合 —— 纯 HTML 行为,不吃长按、不需要脚本
 //   - 标题旁边有个版本标记,用来一眼确认手机上跑的是哪一版
-export const PANEL_VERSION = 4
+export const PANEL_VERSION = 5
 
 export const PANEL_HTML = `<div id="stove-panel">
   <button id="stove-toggle" type="button" title="任务档位">档位</button>
@@ -92,6 +92,20 @@ export const PANEL_JS = `
   window.__stovePanelLoaded = true;
   var $ = function (id) { return document.getElementById(id); };
 
+  // /_bridge 的会话 token。优先用代理注入到 HTML 里的全局变量；
+  // 如果 CSP 把内联脚本挡掉了，就退回读面板 <script> 标签上的 data 属性。
+  // 两者都没有（手工跑代理、未设 PROXY_TOKEN）时保持免鉴权行为。
+  var BRIDGE_TOKEN = window.__STOVE_BRIDGE_TOKEN__ || '';
+  if (!BRIDGE_TOKEN) {
+    var tag = document.querySelector('script[data-stove-token]');
+    if (tag) BRIDGE_TOKEN = tag.getAttribute('data-stove-token') || '';
+  }
+  function bridgeHeaders(extra) {
+    var h = extra || {};
+    if (BRIDGE_TOKEN) h['x-bridge-token'] = BRIDGE_TOKEN;
+    return h;
+  }
+
   function render(s) {
     var dot = $('stove-dot');
     var list = $('stove-list');
@@ -142,7 +156,7 @@ export const PANEL_JS = `
   }
 
   function load() {
-    fetch('/_bridge/status', { cache: 'no-store' })
+    fetch('/_bridge/status', { cache: 'no-store', headers: bridgeHeaders() })
       .then(function (r) { return r.json(); })
       .then(render)
       .catch(function () { render(null); });
@@ -152,7 +166,7 @@ export const PANEL_JS = `
     $('stove-note').textContent = '切换中…';
     fetch('/_bridge/config', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: bridgeHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ profile: key })
     }).then(function (r) { return r.json(); })
       .then(function () {
@@ -360,7 +374,7 @@ export const PANEL_JS = `
       cb.onchange = function (e) {
         fetch('/_bridge/config', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: bridgeHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({ enabled: !!e.target.checked })
         }).catch(function () {});
       };
@@ -404,12 +418,33 @@ export const PANEL_SCRIPT_PATH = '/_stove/panel.js'
  *   - 面板 HTML + 一段**外链** script 放在 </body> 之前
  *   - </body> 不存在时退化为直接追加(上游结构变化时不至于什么都不注入)
  */
-export function injectPanel(html) {
+/** HTML 属性转义（token 是十六进制，但这里不假设调用方一定这样）。 */
+function escapeAttr(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
+
+export function injectPanel(html, options = {}) {
   const head = `<style id="stove-style">${PANEL_CSS}</style>`
+
+  // /_bridge 的会话 token：
+  //   1. 内联给 window.__STOVE_BRIDGE_TOKEN__（面板脚本优先读它）；
+  //   2. 同时挂到外链 script 的 data-stove-token 上 —— 如果上游 CSP 把内联
+  //      脚本挡掉，面板仍能从 DOM 属性拿到 token，手机端不会退化成 401。
+  // 未设置 PROXY_TOKEN 时两者都不注入，保持旧的免鉴权行为。
+  const token = String(options.token || '')
+  const tokenScript = token
+    ? `<script>window.__STOVE_BRIDGE_TOKEN__ = ${JSON.stringify(token).replace(/</g, '\\u003c')}</script>`
+    : ''
+  const tokenAttr = token ? ` data-stove-token="${escapeAttr(token)}"` : ''
+
   // 脚本 URL 带版本号:换版本时浏览器一定会重新取,不会拿旧的面板脚本。
   // (路径本身也设了 no-store,但查询串是第二道保险 —— 有些内置浏览器
   //  对 no-store 处理得并不认真。)
-  const tail = `${PANEL_HTML}<script src="${PANEL_SCRIPT_PATH}?v=${PANEL_VERSION}" defer></script>`
+  const tail = `${tokenScript}${PANEL_HTML}<script src="${PANEL_SCRIPT_PATH}?v=${PANEL_VERSION}"${tokenAttr} defer></script>`
 
   let out = html
   if (out.includes('</head>')) out = out.replace('</head>', `${head}</head>`)
