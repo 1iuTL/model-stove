@@ -23,6 +23,8 @@ const settings = require('./settings');
 const { createPaths, ensureDirs } = require('./core/paths');
 const { Supervisor } = require('./core/supervisor');
 const ports = require('./core/ports');
+const { loadCapabilities } = require('./core/capabilities');
+const { buildStartArgs, gateArgs, classifyStartupError, planRetry } = require('./core/args');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const PROXY_SCRIPT = path.join(REPO_ROOT, 'context-proxy.mjs');
@@ -40,6 +42,9 @@ let current = { ...EMPTY_CURRENT };
 // 任何真正要起进程的入口都会先 ensureRuntime()。
 let paths = null;
 let supervisor = null;
+// 最近一次能力探测结果（默认只在启动某模型时更新）。给 status/catalogue 的
+// 徽章摘要用；原始 Set 不直接跨 IPC。
+let lastCaps = null;
 
 // 兼容旧模块级常量：在 ready 之前调用 runCapture/防火墙自检时仍有一个可写的日志目录。
 // ready 之后会被替换成 paths.logsDir。
@@ -153,6 +158,47 @@ function appendShellLog(text) {
 function readLogTail(maxLines = 250) {
   if (!supervisor) return [];
   return supervisor.readLogTail(undefined, maxLines);
+}
+
+/** 能力缓存的落点：数据目录下的 cache/capabilities.json。 */
+function capsCacheFile() {
+  const base = (paths && paths.cacheDir) || path.join(LOG_DIR, 'cache');
+  return path.join(base, 'capabilities.json');
+}
+
+/** 给 IPC 用的能力摘要（version/build/flags 数），不要把 Set 直接传出去。 */
+function capsSummary(caps) {
+  if (!caps) return null;
+  const flagCount = caps.flags instanceof Set
+    ? caps.flags.size
+    : (Array.isArray(caps.flags) ? caps.flags.length : 0);
+  return {
+    ok: !!caps.ok,
+    version: caps.version || null,
+    build: caps.build == null ? null : caps.build,
+    flagCount,
+    error: caps.ok ? null : (caps.error || null),
+  };
+}
+
+/**
+ * 启动失败的最终文案：报错原文 + 分类 + 可操作建议 + 日志尾巴。
+ * 用户看到的不只是“进程退了”，还有“缺什么/换什么/降什么”。
+ */
+function startupFailureText(error, classification, plan, tail, previous) {
+  const lines = [];
+  lines.push(`服务启动失败或超时:${error && error.message ? error.message : String(error)}`);
+  if (previous) {
+    lines.push(`首次失败分类: ${previous.kind}${previous.evidence ? `（${previous.evidence}）` : ''}`);
+    lines.push('已按计划降级重试一次，仍然失败。');
+  }
+  lines.push(`错误分类: ${classification.kind || 'unknown'}`);
+  if (classification.evidence) lines.push(`证据: ${classification.evidence}`);
+  if (plan && plan.action) lines.push(`建议: ${plan.action}`);
+  if (Array.isArray(tail) && tail.length) {
+    lines.push(`日志末尾:\n${tail.slice(-14).join('\n')}`);
+  }
+  return lines.join('\n');
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -335,6 +381,25 @@ async function startServer(modelId, presetKey, reasoningKey, lanMode, budgetKey,
   if (!binExists(model)) throw new Error(`llama-server 不存在:\n${model.bin}`);
 
   const apiKey = (settings.readSettings().apiKey || '').trim();
+  const overrides = { ctx, kv };
+
+  // 先探测构建能力。探测失败**不阻断**：caps 未知时 gateArgs 走兼容模式，
+  // 参数照旧发送（见 core/capabilities.js 的策略注释）。
+  let caps = null;
+  try {
+    caps = await loadCapabilities(model.bin, { cacheFile: capsCacheFile() });
+  } catch (e) {
+    appendShellLog(`[shell] 构建能力探测异常（兼容模式继续）: ${e.message}`);
+  }
+  lastCaps = caps || null;
+  if (caps && caps.ok) {
+    appendShellLog(`[shell] 构建能力: version=${caps.version || '未知'} `
+      + `build=${caps.build == null ? '未知' : caps.build} flags=${caps.flags.size}`);
+  } else {
+    appendShellLog('[shell] 构建能力探测失败（兼容模式：参数照旧发送）: '
+      + `${caps && caps.error ? caps.error : '未知错误'}`);
+  }
+
   let spawnedArgs = null;
   const sup = ensureSupervisor();
 
@@ -347,16 +412,87 @@ async function startServer(modelId, presetKey, reasoningKey, lanMode, budgetKey,
       modelId,
       preset: presetKey,
       argsForPort: (port) => {
-        spawnedArgs = buildArgs(model, presetKey, port, reasoningKey, lanMode, apiKey, budgetKey, { ctx, kv });
+        // 端口由 Supervisor 动态选出后再拼 argv；参数门控在 buildArgs 外面，
+        // 不改变 buildArgs() 的语义（90 例快照仍是逐字节基准）。
+        const built = buildStartArgs({
+          model, presetKey, port, reasoningKey, lanMode, apiKey, budgetKey, overrides, caps,
+        });
+        spawnedArgs = built.args;
         return spawnedArgs;
       },
     });
-  } catch (e) {
-    const tail = (e && Array.isArray(e.logTail) && e.logTail.length)
-      ? e.logTail
-      : readLogTail(14);
-    throw new Error(`服务启动失败或超时:${e.message}` +
-      (tail.length ? `\n日志末尾:\n${tail.join('\n')}` : ''));
+  } catch (firstError) {
+    const firstTail = (firstError && Array.isArray(firstError.logTail) && firstError.logTail.length)
+      ? firstError.logTail
+      : readLogTail(40);
+    const firstClass = classifyStartupError(firstTail);
+    appendShellLog(`[shell] 启动失败分类: ${firstClass.kind}`
+      + `${firstClass.evidence ? ` — ${firstClass.evidence}` : ''}`);
+
+    // 用本次实际端口重建“未门控”的旧 argv，再交给 planRetry。
+    const failedPort = Number.isInteger(sup.lastPort) ? sup.lastPort : null;
+    let legacyArgs = [];
+    if (failedPort != null) {
+      try {
+        legacyArgs = buildArgs(model, presetKey, failedPort, reasoningKey, lanMode, apiKey, budgetKey, overrides);
+      } catch { legacyArgs = spawnedArgs ? spawnedArgs.slice() : []; }
+    } else {
+      legacyArgs = spawnedArgs ? spawnedArgs.slice() : [];
+    }
+
+    const plan = planRetry(legacyArgs, caps, firstClass.kind);
+    const firstArgs = spawnedArgs || legacyArgs;
+    const argsDiffer = JSON.stringify(plan.args) !== JSON.stringify(firstArgs);
+
+    if (plan.changed && argsDiffer) {
+      appendShellLog(`[shell] 首次启动失败(${firstClass.kind})，降级重试: ${plan.action}`);
+      // 同一个 handle 生命周期：先 stop（把半活进程/台账收干净）再 start。
+      try {
+        await sup.stop({ graceMs: 3000 });
+      } catch (e) {
+        appendShellLog(`[shell] 降级重试前停止失败: ${e.message}`);
+      }
+
+      try {
+        st = await sup.start({
+          exe: model.bin,
+          modelId,
+          preset: presetKey,
+          argsForPort: (port) => {
+            // 重试会拿到新端口，必须在**新端口**上重新生成 argv，
+            // 不能直接复用 plan.args（里面是上一次的 --port）。
+            const retryLegacy = buildArgs(
+              model, presetKey, port, reasoningKey, lanMode, apiKey, budgetKey, overrides,
+            );
+            const retryPlan = planRetry(retryLegacy, caps, firstClass.kind);
+            // planRetry(missing-chat-template) 只摘 --jinja，不会重新门控；
+            // 这里必须再走一次 gateArgs，否则重试会把首次已删掉的
+            // “旧构建不支持的参数”又发回去。
+            const retryGated = gateArgs(retryPlan.args, caps);
+            if (retryGated.unsupportedRequired.length) {
+              throw new Error(
+                `这个 llama-server 缺少外壳必需的核心参数: ${retryGated.unsupportedRequired.join(', ')}\n`
+                + `它很可能不是 llama-server，或者构建太旧。`,
+              );
+            }
+            spawnedArgs = retryGated.args;
+            return spawnedArgs;
+          },
+        });
+        appendShellLog(`[shell] 降级启动已就绪 ${st.url} (端口 ${st.port}, PID ${st.pid})`);
+      } catch (secondError) {
+        const secondTail = (secondError && Array.isArray(secondError.logTail) && secondError.logTail.length)
+          ? secondError.logTail
+          : readLogTail(40);
+        const secondClass = classifyStartupError(secondTail);
+        const secondPlan = planRetry(spawnedArgs || [], caps, secondClass.kind);
+        throw new Error(
+          startupFailureText(secondError, secondClass, secondPlan, secondTail, firstClass),
+        );
+      }
+    } else {
+      throw new Error(startupFailureText(firstError, firstClass, plan, firstTail));
+    }
   }
 
   // 记进 current 的是**真正生效**的值，不是界面传进来的意向值 ——
@@ -551,6 +687,9 @@ ipcMain.handle('catalogue', () => ({
   // 起始端口（不是"当前端口"）。运行中的真实端口从 status IPC 取 ——
   // 界面用 s.port 更新状态栏与局域网直连地址。
   port: serviceStatus().port || configuredBasePort(),
+  // 可选徽章信息：最近一次探测到的 llama-server 构建能力摘要。
+  // 只加字段，不改任何既有字段。
+  caps: capsSummary(lastCaps),
 }));
 
 // ------------------------------------------------------------------ 设置 / 局域网
@@ -643,6 +782,8 @@ ipcMain.handle('status', async () => {
     port: st.port || null,
     pid: st.pid || null,
     url: health.ok ? base : null,
+    // 可选徽章信息（version/build/flags 数）。既有字段不变。
+    caps: capsSummary(lastCaps),
   };
 });
 
@@ -1417,4 +1558,8 @@ module.exports.__test = {
     } : null,
     supervisor: serviceStatus(),
   }),
+  // P1：构建能力探测/参数门控/失败分类。测试可以直接验证接线后的行为。
+  loadCapabilities, buildStartArgs, classifyStartupError, planRetry,
+  capsSummary,
+  caps: () => capsSummary(lastCaps),
 };

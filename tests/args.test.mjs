@@ -6,7 +6,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import path from 'node:path';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
@@ -320,6 +319,19 @@ test('planRetry missing-chat-template：去掉 --jinja，并提示只能纯补�
   // 再规划一次不应该再变（只降一次）
   const again = argsMod.planRetry(plan.args, ALL_CAPS, 'missing-chat-template');
   assert.equal(again.changed, false);
+});
+
+test('missing-chat-template 的降级结果必须仍经过 gateArgs（否则会复活不支持参数）', () => {
+  const c = byId('model=onbit preset-vision64k');
+  const broken = capsWithout('-fa', '--reasoning-budget', '--mmproj');
+  const plan = argsMod.planRetry(c.legacy, broken, 'missing-chat-template');
+  assert.ok(!plan.args.includes('--jinja'));
+  const gated = argsMod.gateArgs(plan.args, broken);
+  for (const f of ['-fa', '-ctk', '-ctv', '--reasoning-budget', '--mmproj',
+    '--no-mmproj-offload', '--image-max-tokens']) {
+    assert.ok(!gated.args.includes(f), `重试 argv 里仍残留 ${f}`);
+  }
+  assert.ok(gated.args.includes('-m') && gated.args.includes('--port'));
 });
 
 test('planRetry oom：不改 argv，建议降 ctx / 换 KV 精度', () => {
