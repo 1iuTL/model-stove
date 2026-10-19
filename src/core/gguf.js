@@ -662,7 +662,11 @@ function getHeadCountValues(meta, which = 'head', arch = getArchitecture(meta)) 
 function getHeadCount(meta, which = 'head', arch = getArchitecture(meta)) {
   const values = getHeadCountValues(meta, which, arch);
   if (!values || !values.length) return null;
-  return Math.max(...values);
+  let max = values[0];
+  for (let i = 1; i < values.length; i++) {
+    if (values[i] > max) max = values[i];
+  }
+  return max;
 }
 
 function getHeadCountKv(meta, arch = getArchitecture(meta)) {
