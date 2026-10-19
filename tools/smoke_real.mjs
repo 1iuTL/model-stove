@@ -11,6 +11,7 @@
 //   MODEL_ID=qwen36-abl node tools/smoke_real.mjs   # 换模型条目
 //   SMOKE_MAX_TOKENS=32 node tools/smoke_real.mjs   # 推理 token 上限（默认 64）
 //   SMOKE_PORT=8091 node tools/smoke_real.mjs       # 起始端口
+//   SMOKE_EXE=D:\...\llama-server.exe node tools/smoke_real.mjs  # 临时用另一个构建对比
 //
 // 退出码：0 = 全链路通过；1 = 失败（会打印分类与日志尾巴）；2 = 前置文件缺失。
 import fs from 'node:fs';
@@ -32,7 +33,8 @@ if (!model) {
   console.error(`✗ 未知模型条目: ${modelId}（可选: ${cfg.MODELS.map((m) => m.id).join(', ')}）`);
   process.exit(2);
 }
-const missing = [model.bin, model.file].filter((f) => !fs.existsSync(f));
+const exe = process.env.SMOKE_EXE ? path.resolve(process.env.SMOKE_EXE) : model.bin;
+const missing = [exe, model.file].filter((f) => !fs.existsSync(f));
 if (missing.length) {
   console.error('✗ 前置文件缺失：');
   for (const f of missing) console.error('   ', f);
@@ -42,12 +44,12 @@ if (missing.length) {
 
 console.log('== 前置 ==');
 console.log('模型条目:', model.id, '|', model.name);
-console.log('exe   :', model.bin);
+console.log('exe   :', exe, process.env.SMOKE_EXE ? '(SMOKE_EXE 覆盖)' : '');
 console.log('model :', model.file, `(${(fs.statSync(model.file).size / 2 ** 30).toFixed(2)} GiB)`);
 
 console.log('\n== 能力探测 ==');
 const tProbe = Date.now();
-const caps = loadCapabilities(model.bin, { cache: false });
+const caps = loadCapabilities(exe, { cache: false });
 console.log(`ok=${caps.ok} version=${caps.version || '?'} build=${caps.build || '?'} flags=${caps.flags ? caps.flags.size : 0} 用时 ${Date.now() - tProbe}ms`);
 if (!caps.ok) console.log('探测失败，将走兼容模式（argv 原样）:', caps.error || '');
 
@@ -66,7 +68,7 @@ let st;
 const t0 = Date.now();
 try {
   st = await sup.start({
-    exe: model.bin,
+    exe,
     modelId: model.id,
     preset: model.defaultPreset,
     argsForPort: (port) => {
