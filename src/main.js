@@ -26,9 +26,33 @@ const { Supervisor } = require('./core/supervisor');
 const ports = require('./core/ports');
 const { loadCapabilities } = require('./core/capabilities');
 const { buildStartArgs, gateArgs, classifyStartupError, planRetry, assertLanSafety } = require('./core/args');
+const { resolveScriptRoot, resolveScriptPath } = require('./core/script-paths');
 
 const REPO_ROOT = path.join(__dirname, '..');
-const PROXY_SCRIPT = path.join(REPO_ROOT, 'context-proxy.mjs');
+// 打包后 REPO_ROOT 是 resources\app.asar（__dirname 在 asar 内）。
+// 普通 require() 走 asar 没问题，但交给**外部进程**执行的脚本不行：
+// node.exe 跑 context-proxy.mjs、powershell.exe 跑 tools\allow-lan.ps1，
+// 它们读不到 asar。electron-builder 的 asarUnpack 把这些文件放到
+// resources\app.asar.unpacked，所以脚本路径统一由 script-paths 解析。
+//
+// app.isPackaged 在模块加载期可用；测试桩里没有这个字段时，
+// 模块内会按 REPO_ROOT 是否以 app.asar 结尾兜底，这里照样传布尔值。
+const IS_PACKAGED = typeof app.isPackaged === 'boolean'
+  ? app.isPackaged
+  : /app\.asar[\\/]*$/i.test(REPO_ROOT);
+const SCRIPT_ROOT = resolveScriptRoot({ repoRoot: REPO_ROOT, isPackaged: IS_PACKAGED });
+const PROXY_SCRIPT = resolveScriptPath({
+  repoRoot: REPO_ROOT,
+  isPackaged: IS_PACKAGED,
+  relative: 'context-proxy.mjs',
+});
+// allow-lan.ps1 会 dot-source 同目录的 firewall-rules.ps1，allow-lan.cmd 再
+// 调 allow-lan.ps1；三者必须一起解包，缺一个放行功能就断（见 electron-builder.yml）。
+const ALLOW_LAN_SCRIPT = resolveScriptPath({
+  repoRoot: REPO_ROOT,
+  isPackaged: IS_PACKAGED,
+  relative: path.join('tools', 'allow-lan.ps1'),
+});
 
 // 默认起始端口。真正的端口由 Supervisor 从它开始扫描空闲值，不再写死。
 const DEFAULT_SERVER_PORT = 8091;
@@ -1899,7 +1923,9 @@ function startProxy(options = {}) {
       p = spawn(nodeExe, [PROXY_SCRIPT], {
         windowsHide: true,
         detached: true,
-        cwd: REPO_ROOT,
+        // 打包后 REPO_ROOT 是 app.asar 这个**文件**，不能当 cwd；
+        // 未打包时 SCRIPT_ROOT === REPO_ROOT，行为与旧版一致。
+        cwd: SCRIPT_ROOT,
         // 环境变量是代理唯一的启动期配置入口：
         //   PROXY_TARGET   当前 llama-server（动态端口，不能再用写死的 8091）
         //   PROXY_TOKEN    /_bridge 的会话 token（主进程自己的调用与注入面板共用）
@@ -2062,7 +2088,8 @@ function stopProxy() {
  * 加没加上由界面稍后调 firewallStatus 自检(查询不需要管理员)。
  */
 function launchFirewallHelper() {
-  const script = path.join(REPO_ROOT, 'tools', 'allow-lan.ps1');
+  // 外部 PowerShell 执行：打包后必须指向 app.asar.unpacked（见文件顶部）。
+  const script = ALLOW_LAN_SCRIPT;
   if (!fs.existsSync(script)) return { ok: false, error: `找不到脚本:${script}` };
   const ps = process.env.SystemRoot
     ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')

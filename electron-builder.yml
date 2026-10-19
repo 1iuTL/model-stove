@@ -15,10 +15,30 @@ files:
   - src/**/*
   - context-proxy.mjs
   - ui-inject.mjs
+  - tools/allow-lan.ps1
+  - tools/allow-lan.cmd
+  - tools/firewall-rules.ps1
   - icon-256.png
   - LICENSE
   - README.md
   - package.json
+
+# 交给外部进程执行的脚本必须解包到 resources/app.asar.unpacked：
+#   - context-proxy.mjs / ui-inject.mjs：外部 node.exe 执行（后者是前者的
+#     静态 import，必须同目录）；
+#   - src/profiles.js / src/core/security.js：context-proxy.mjs 用
+#     createRequire(import.meta.url) 按相对路径 require，解包后也要在
+#     app.asar.unpacked 里保持同样的相对结构，否则 MODULE_NOT_FOUND；
+#   - tools/*.ps1 / .cmd：PowerShell、cmd 执行，且 allow-lan.ps1 会 dot-source
+#     同目录的 firewall-rules.ps1，allow-lan.cmd 调 allow-lan.ps1，三个缺一不可。
+asarUnpack:
+  - context-proxy.mjs
+  - ui-inject.mjs
+  - src/profiles.js
+  - src/core/security.js
+  - tools/allow-lan.ps1
+  - tools/allow-lan.cmd
+  - tools/firewall-rules.ps1
 
 win:
   target:
