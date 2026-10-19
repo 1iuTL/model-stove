@@ -210,3 +210,76 @@ BOOLEAN_KEYS = ['probe', 'lanMode', 'keepServerOnClose', 'deviceAuth'];
 - **无 TLS / 无设备数量上限 / 单进程单写者**：继承 P1 代理层与安全核心的既有
   限制（见 `docs/P1-安全接线.md` 第八节）。
 - **审计不是防篡改账本**：`issue` 事件同样只用于运行诊断。
+
+## 十、安全日志查看（补充）
+
+> 补充范围：`context-proxy.mjs`（仅新增审计端点）、`src/main.js`、
+> `src/preload.js`、`src/index.html`、`tools/test_security_wiring.mjs`（追加）、
+> `tools/test_security_ui_wiring.mjs`（追加）与本小节。默认行为不变。
+
+### 端点
+
+```http
+GET /_security/audit?limit=100
+x-bridge-token: <token>
+```
+
+与其它 `/_security/*` 完全一致：先过 `bridgeAuthorized(req)`（未设置
+`PROXY_TOKEN` 时免鉴权），再按 IP 限流；响应一律 `Cache-Control: no-store`，
+错误统一 `{ ok: false, error }`。
+
+- `limit` 默认 **100**，范围 **1..500**；缺省、非整数、越界都回退默认值，
+  不返回 400（只读诊断端点）。
+- 成功：`{ "ok": true, "entries": [...], "file": "<PROXY_STATE_DIR>/audit.jsonl" }`。
+- `entries` 直接来自 `audit.read({ limit })`：按时间从旧到新，字段只有
+  `ts` / `event` / `deviceId?` / `ip?` / `detail?`；不读请求体，因此不含
+  prompt、明文设备 key、上游 key。
+- 非 GET → 405 `method_not_allowed`；审计文件读失败 → 500 `internal`。
+
+### 主进程与 preload
+
+- IPC `security:audit`：参数 `{ limit }`，经 `proxyRequest('GET',
+  '/_security/audit?limit=...')` 发出；返回统一 `{ ok: true, data }` 或
+  `{ ok: false, error, status?, offline? }`，代理离线不抛异常。
+- `__test.securityAudit` 暴露同名函数；preload 暴露
+  `securityAudit(limit)`。
+- limit 在主进程也会归一化（非法回退 100），代理层再兜一次。
+
+### 设置页
+
+「设备访问（局域网）」小节新增：
+
+| id | 作用 |
+|---|---|
+| `btnAudit` | 「查看安全日志」；代理在线/离线都可点 |
+| `auditBox` | 默认隐藏的 `<pre>`；显示最近 100 条，每行 `时间 \| 事件 \| IP \| detail` |
+
+点击按钮 → `securityAudit(100)` → 用 `textContent` 渲染纯文本（设备名/detail
+来自外部输入，不拼 `innerHTML`）；再点一次收起。空结果显示「安全日志还是空的」，
+代理离线/请求失败把原因写进 `deviceHint`。审计内容不持久化到渲染层。
+
+### 测试
+
+- `tools/test_security_wiring.mjs` 追加 14 项：无 token 401、401 no-store、
+  token 200 且 `entries` 为数组、200 no-store、`file` 指向状态目录、
+  包含此前产生的 `pair_create`/`pair_redeem_ok`/`issue`/`auth_ok`、顺序与文件
+  最后一条一致、`limit=2` 只返回 2 条、`limit=0/abc/501/-3` 回退默认、
+  响应不含设备 key/上游 key、POST 405。
+- `tools/test_security_ui_wiring.mjs` 追加静态断言：`security:audit` IPC、
+  `__test.securityAudit`、preload `securityAudit`、`#btnAudit`/`#auditBox`
+  及内联脚本引用、`textContent` 渲染、代理 `/_security/audit` 与
+  `auditLog.read({ limit })`/`file: AUDIT_FILE`、集成测试覆盖。
+
+验收（Windows，node 24.22，真实执行）：两个安全测试全部通过；`npm test`
+393/393；`test_shell_load.mjs`、`check_ui.cjs`（78 个 id 无重复）、
+`test_main_wiring.mjs`、`test_catalog_wiring.mjs`、`test_adoption_wiring.mjs`、
+`test_security_p0.mjs` 全部通过。没有 `npm install`、没有启动 Electron GUI、
+没有 push。
+
+### 限制
+
+- 审计端点同样受 `PROXY_TOKEN` 为空时免鉴权的影响（复用 `bridgeAuthorized`
+  既有语义）；生产必须依赖外壳生成的 token。
+- 只返回 `audit.read` 的内容，不做跨文件搜索/过滤/分页；5 MiB 轮转后更早的
+  记录只能查 `.1`/`.2`。
+- 审计不是防篡改账本，本机可改/删；UI 只是运行诊断视图。
