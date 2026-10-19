@@ -5,6 +5,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('shell', {
   /** 取模型 / 预设 / 思考强度清单。 */
   catalogue: () => ipcRenderer.invoke('catalogue'),
+  /** 重新扫描模型目录（P4：缺失模型/构建引导面板的「重新扫描」按钮用）。 */
+  refreshCatalogue: () => ipcRenderer.invoke('catalogue:refresh'),
   /** 启动服务。
    *  reasoning 为思考强度键名;lanMode 为 true 时监听 0.0.0.0;
    *  budget 为思考预算键名(见 catalogue 的 budgets),缺省用默认档;

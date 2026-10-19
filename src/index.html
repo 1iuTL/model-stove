@@ -83,6 +83,9 @@
   }
   #settings .note { color: var(--dim); font-size: 11px; margin-top: 6px; }
   #settings .note b { color: var(--warn); font-weight: 500; }
+  /* 模型缺失引导面板复用设置页的提示样式；只加选择器，不改既有观感。 */
+  #modelGuide .note { color: var(--dim); font-size: 11px; margin-top: 6px; }
+  #modelGuide .note b { color: var(--warn); font-weight: 500; }
 
   /* 小号行内按钮:放行防火墙 / 启动停止代理 */
   button.mini {
@@ -115,7 +118,7 @@
   .lanurl button {
     width: auto; flex: 0 0 auto; padding: 3px 8px; font-size: 11px; font-weight: 400;
   }
-  #settings .warn {
+  #settings .warn, #modelGuide .warn {
     background: #2a1f10; border: 1px solid #5a4a1a; color: #e8c46a;
     border-radius: 6px; padding: 7px 9px; font-size: 11px; line-height: 1.5;
     margin-bottom: 7px;
@@ -170,6 +173,35 @@
     background: #2a2211; border: 1px solid #55451a; color: #e8c46a;
     font-size: 10.5px; line-height: 1.45;
   }
+
+  /* --------------------------------------------------- 模型徽章 / 缺失引导 */
+  /* 徽章只消费 catalogue 里的安全摘要（arch/ctxTrain/experts/thinking/
+     mmproj/source/sizeBytes），没有对应字段就整颗不渲染。 */
+  .badges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+  .badge {
+    display: inline-block; padding: 1px 5px; border-radius: 4px;
+    border: 1px solid var(--line); background: #10131a; color: var(--dim);
+    font-size: 10px; line-height: 1.5; white-space: nowrap;
+  }
+  .badge.arch { color: #c9d1d9; border-color: #3a4150; }
+  .badge.ctx { color: #8ab4f8; border-color: #2b4a7d; }
+  .badge.moe { color: #d2a8ff; border-color: #4a2d6a; }
+  .badge.think { color: #e8c46a; border-color: #5a4a1a; }
+  .badge.vision { color: #56d364; border-color: #2d5a35; }
+  .badge.source-scan { color: #79c0ff; }
+  .badge.source-legacy { color: var(--dim); }
+  .badge.size { color: #c9d1d9; }
+
+  #modelGuide { margin: 0 0 10px; }
+  #modelGuide.hidden, #modelGuide .hidden { display: none; }
+  #modelGuide .warn { margin-bottom: 6px; }
+  #modelGuide ul.missing { margin: 4px 0 0; padding-left: 16px; }
+  #modelGuide ul.missing li { margin: 2px 0; }
+  #modelGuide code {
+    background: var(--panel-2); border-radius: 3px; padding: 1px 4px;
+    color: #c9d1d9; font-size: 10.5px; word-break: break-all;
+  }
+  #modelGuide .btnrow { display: flex; gap: 6px; margin-top: 7px; }
 
   /* ------------------------------------------------------------ 上下文滑块 */
   .ctx-head {
@@ -393,6 +425,17 @@
   <div class="scroll">
     <div class="group">
       <div class="label">模型</div>
+      <!-- 缺失模型/构建引导：catalogue 里全部 present 且 binPresent 时隐藏。
+           只读展示 + 手动「重新扫描」，不改列表的选中/启动逻辑。 -->
+      <div id="modelGuide" class="hidden">
+        <div class="warn" id="guideStats"></div>
+        <div class="note hidden" id="guideMissing"></div>
+        <div class="note hidden" id="guideRoot"></div>
+        <div class="note hidden" id="guideBuild"></div>
+        <div class="btnrow">
+          <button id="btnRescan" class="mini">重新扫描</button>
+        </div>
+      </div>
       <div id="models"></div>
     </div>
     <div class="group">
@@ -585,6 +628,188 @@ function loadReasoning() {
   return 'server-default';
 }
 
+// --------------------------------------------------- 模型徽章 / 缺失引导（P4）
+
+/** 文件大小 → GiB，保留 1 位小数（13.65 GiB 显示 13.6，与文档口径一致）。 */
+function fmtGiB(bytes) {
+  const n = Number(bytes);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return (Math.floor((n / (1024 * 1024 * 1024)) * 10) / 10).toFixed(1) + ' GiB';
+}
+
+/**
+ * catalogue 条目 → 紧凑徽章列表 [class, text]。
+ * 字段缺失/为假就不产出徽章，卡片仍保留原来的 note 文案。
+ */
+function modelBadgeItems(m) {
+  const meta = m.meta || {};
+  const out = [];
+  if (meta.arch) out.push(['arch', String(meta.arch)]);
+  if (Number.isFinite(meta.ctxTrain) && meta.ctxTrain > 0) out.push(['ctx', fmtCtx(meta.ctxTrain)]);
+  const ex = meta.experts;
+  if (ex && Number.isFinite(ex.count)) {
+    out.push(['moe', 'MoE ' + ex.count + (Number.isFinite(ex.used) ? '/' + ex.used : '')]);
+  }
+  if (meta.thinking === true) out.push(['think', '思考']);
+  if (m.mmproj) out.push(['vision', '视觉']);
+  if (m.source === 'scan') out.push(['source-scan', '扫描']);
+  else if (m.source === 'legacy') out.push(['source-legacy', '配置']);
+  const size = fmtGiB(m.sizeBytes);
+  if (size) out.push(['size', size]);
+  return out;
+}
+
+/** 往卡片里追加徽章行；没有可显示的字段时什么都不加（旧 note 照常显示）。 */
+function appendModelBadges(card, m) {
+  const items = modelBadgeItems(m);
+  if (!items.length) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'badges';
+  for (const [cls, text] of items) {
+    const span = document.createElement('span');
+    span.className = 'badge ' + cls;
+    span.textContent = text;
+    wrap.appendChild(span);
+  }
+  card.appendChild(wrap);
+}
+
+/** 清空一个引导块并先隐藏；返回节点方便按需填充。 */
+function clearGuideBlock(id) {
+  const el = $(id);
+  el.innerHTML = '';
+  el.classList.add('hidden');
+  return el;
+}
+
+/** 追加纯文本片段（路径/环境变量都走 textContent，绝不拼 innerHTML）。 */
+function appendGuideText(parent, text) {
+  const span = document.createElement('span');
+  span.textContent = text;
+  parent.appendChild(span);
+}
+
+/** 追加一个 <code> 片段。 */
+function appendGuideCode(parent, text) {
+  const code = document.createElement('code');
+  code.textContent = text;
+  parent.appendChild(code);
+}
+
+/**
+ * 缺失模型/构建引导面板。
+ *
+ * 触发条件：任一条目 present === false 或 binPresent === false。
+ * 全部存在时整块隐藏；内容只读展示，真正的动作只有「重新扫描」。
+ */
+function renderGuide() {
+  const panel = $('modelGuide');
+  const models = (CATALOGUE && CATALOGUE.models) || [];
+  const missingModels = models.filter((m) => m.present === false);
+  const missingBins = models.filter((m) => m.binPresent === false);
+  if (!missingModels.length && !missingBins.length) {
+    panel.classList.add('hidden');
+    return;
+  }
+  panel.classList.remove('hidden');
+
+  $('guideStats').textContent = `缺 ${missingModels.length} 个模型文件 · 缺构建：`
+    + (missingBins.length ? '有' : '无');
+
+  // 缺失文件路径：最多列 3 条，剩下的只报数量。
+  const missingBox = clearGuideBlock('guideMissing');
+  if (missingModels.length) {
+    missingBox.classList.remove('hidden');
+    const lead = document.createElement('div');
+    lead.textContent = '缺失文件（最多显示 3 条）：';
+    missingBox.appendChild(lead);
+    const ul = document.createElement('ul');
+    ul.className = 'missing';
+    for (const m of missingModels.slice(0, 3)) {
+      const li = document.createElement('li');
+      const code = document.createElement('code');
+      code.textContent = m.file || '(未配置路径)';
+      li.appendChild(code);
+      ul.appendChild(li);
+    }
+    if (missingModels.length > 3) {
+      const li = document.createElement('li');
+      li.textContent = `…另有 ${missingModels.length - 3} 个`;
+      ul.appendChild(li);
+    }
+    missingBox.appendChild(ul);
+  }
+
+  // 建议模型目录（suggestedModelRoot 只给 root/source/candidates 数量）。
+  const rootBox = clearGuideBlock('guideRoot');
+  const suggestion = CATALOGUE && CATALOGUE.suggestedModelRoot;
+  if (suggestion && suggestion.root) {
+    rootBox.classList.remove('hidden');
+    appendGuideText(rootBox, '建议模型目录：');
+    appendGuideCode(rootBox, suggestion.root);
+    appendGuideText(rootBox, '。把 .gguf 放进该目录，或设置环境变量 ');
+    appendGuideCode(rootBox, 'MODEL_STOVE_MODELS');
+    appendGuideText(rootBox, '（支持多个目录，用 ; 分隔）。');
+  }
+
+  // 构建提示：只在“没有构建根且默认构建也不存在”时出现，避免误导。
+  const buildBox = clearGuideBlock('guideBuild');
+  const buildRoots = (CATALOGUE && CATALOGUE.buildRoots) || [];
+  const buildBinary = (CATALOGUE && CATALOGUE.buildBinary) || null;
+  if (buildRoots.length === 0 && (!buildBinary || buildBinary.present === false)) {
+    buildBox.classList.remove('hidden');
+    if (buildBinary && buildBinary.path) {
+      appendGuideText(buildBox, '没有找到可用构建。当前默认构建路径：');
+      appendGuideCode(buildBox, buildBinary.path);
+      appendGuideText(buildBox, '（不存在）。把 ');
+    } else {
+      appendGuideText(buildBox, '没有找到可用构建。把 ');
+    }
+    appendGuideCode(buildBox, 'llama-server.exe');
+    appendGuideText(buildBox, ' 放到构建根目录，或设置环境变量 ');
+    appendGuideCode(buildBox, 'MODEL_STOVE_BUILDS');
+    appendGuideText(buildBox, '（支持多个目录，用 ; 分隔）。');
+  }
+}
+
+/**
+ * 「重新扫描」：调 preload 的 refreshCatalogue() → catalogue:refresh，
+ * 成功后重新拉 catalogue 并重绘模型/预设/滑块。只改显示，不碰启动链路。
+ */
+async function rescanCatalogue() {
+  const b = $('btnRescan');
+  const oldText = b.textContent;
+  b.disabled = true;
+  b.textContent = '扫描中…';
+  try {
+    const summary = await window.shell.refreshCatalogue();
+    CATALOGUE = await window.shell.catalogue();
+    // 扫描后模型可能消失：保留仍然可用的选择，否则回落到第一个可启动模型。
+    const keep = (CATALOGUE.models || []).find((m) => m.id === selModel && m.present);
+    if (!keep) {
+      const first = (CATALOGUE.models || []).find((m) => m.present);
+      selModel = first ? first.id : null;
+      selPreset = first ? first.defaultPreset : null;
+      selCtx = null;
+    }
+    renderModels();
+    renderGuide();
+    renderPresets();
+    renderKv();
+    renderCtx();
+    refreshButtons();
+    // 扫描警告只做补一句提示，不改变面板的显示/隐藏规则。
+    const warns = (summary && summary.warnings) || [];
+    if (warns.length) $('guideStats').textContent += ` · ${warns.length} 条扫描警告`;
+  } catch (e) {
+    $('guideStats').textContent = '重新扫描失败：' + (e && e.message ? e.message : e);
+    $('modelGuide').classList.remove('hidden');
+  } finally {
+    b.disabled = false;
+    b.textContent = oldText;
+  }
+}
+
 function renderModels() {
   const box = $('models');
   box.innerHTML = '';
@@ -599,6 +824,8 @@ function renderModels() {
     d.className = 'd';
     d.textContent = m.present ? m.note : '文件缺失:' + m.file;
     b.appendChild(t);
+    // P4：有 meta/mmproj/source/sizeBytes 才出徽章；没有则保持旧 note 回退。
+    appendModelBadges(b, m);
     b.appendChild(d);
     // 已知有问题的模型直接标在卡片上 —— 否则用户只能靠名字猜
     if (m.warn) {
@@ -1427,13 +1654,15 @@ async function showLogs() {
   selBudget = loadBudget();
   selCtx = loadCtx();
   selKv = loadKv();
-  renderModels(); renderPresets(); renderReasoning(); renderBudgets(); renderKv(); renderCtx(); refreshButtons();
+  renderModels(); renderGuide(); renderPresets(); renderReasoning(); renderBudgets(); renderKv(); renderCtx(); refreshButtons();
   applyReasoningVisibility();
   await loadSettingsToUi();
   await refresh();
 
   $('btnStart').onclick = doStart;
   $('btnStop').onclick = doStop;
+  // P4：缺失模型/构建引导面板的「重新扫描」。
+  $('btnRescan').onclick = rescanCatalogue;
   $('btnSettings').onclick = () => {
     const box = $('settings');
     box.classList.toggle('hidden');

@@ -539,6 +539,55 @@ function runtimeModels() {
   });
 }
 
+/**
+ * 当前默认构建的摘要（给 catalogue 的 buildBinary 字段）。
+ *
+ * 只暴露 path/present 两个值，绝不把构建能力或 argv 等大对象带进 IPC。
+ * 解析顺序：config.BIN.stock（存在即用）→ runtimeModels() 里第一个存在的
+ * bin（构建根或其余 BIN 条目）。都没有时 present=false，path 仍保留
+ * config.BIN.stock 的配置值（界面可显示"当前默认构建路径（若有）"）。
+ */
+function buildBinarySummary() {
+  const stock = BIN && typeof BIN.stock === 'string' && BIN.stock.trim()
+    ? path.resolve(BIN.stock.trim())
+    : null;
+  if (stock && fileExists(stock)) return { path: stock, present: true };
+
+  let fallback = null;
+  try {
+    const hit = runtimeModels().find((m) => m.binPresent && m.bin);
+    if (hit) fallback = path.resolve(String(hit.bin));
+  } catch { /* 目录异常时只报 stock 的状态，不影响 catalogue 其它字段 */ }
+  if (fallback) return { path: fallback, present: true };
+
+  return { path: stock, present: false };
+}
+
+/**
+ * catalogue 新增的目录/构建摘要（任务 A）。
+ *
+ * 全部是 JSON 安全值：字符串数组 + 小对象；suggestedModelRoot 只给
+ * candidates 的数量，不把整份候选盘列表（含 freeBytes）塞进 IPC。
+ */
+function catalogueEnvironment() {
+  if (!paths) initRuntime();
+  const roots = (paths && paths.modelRoots) || [];
+  const builds = (paths && paths.buildRoots) || [];
+  const suggestion = paths && paths.suggestedModelRoot;
+  return {
+    modelRoots: roots.slice(),
+    suggestedModelRoot: suggestion && suggestion.root
+      ? {
+        root: String(suggestion.root),
+        source: String(suggestion.source || ''),
+        candidates: Array.isArray(suggestion.candidates) ? suggestion.candidates.length : 0,
+      }
+      : null,
+    buildRoots: builds.slice(),
+    buildBinary: buildBinarySummary(),
+  };
+}
+
 // ------------------------------------------------------------ 启动速度探针
 //
 // 实现搬到了 src/probe.js —— 那边不依赖 electron,可以被真实服务器测到。
@@ -1104,62 +1153,72 @@ function createWindow() {
 
 // --------------------------------------------------------------------- IPC
 
-ipcMain.handle('catalogue', () => ({
-  // P2：来源是 initRuntime() 缓存的扫描目录（扫描根 + 旧配置合并）。
-  // 旧字段一个不少；新增 source/meta/sizeBytes/mmproj。
-  // meta 只是安全摘要（arch/ctx/层数/专家/思考/模板字节数），
-  // 绝不把 GGUF 原始 metadata（BigInt + 超大数组）带进 IPC。
-  models: runtimeModels().map((m) => ({
-    id: m.id,
-    name: m.name,
-    note: m.note,
-    file: m.file,
-    defaultPreset: m.defaultPreset,
-    present: m.present,
-    binPresent: m.binPresent,
-    warn: m.warn || null,
-    // 上下文滑块的边界,按 KV 精度分别给:
-    //   safeCtx  { q4_0: N, q8_0: M } —— 本机实测"不会溢出"的值(见 config.js)
-    //   maxCtx   模型自身声明的上限
-    // safeCtx 比 maxCtx 小,而且随 KV 精度变化(精度越高 KV 越大、装得越少),
-    // 所以整对象传过去,由界面按当前选中的 KV 精度取值 —— 这样拖动 KV 选择器
-    // 时安全区能立刻联动,不需要再走一次 IPC。
-    safeCtx: m.safeCtx || null,
-    maxCtx: m.maxCtx || null,
-    probeTps: m.probeTps || null,
-    // 混合注意力里"多少层带 KV cache" —— 界面用它生成解释文案,
-    // 而不是把某一种模型的层数写死在 HTML 里(那已经错过一次了)。
-    kvLayers: m.kvLayers || null,
-    // ---- P2 新增（只加字段，不改既有语义）----
-    source: m.source,
-    meta: m.meta,
-    sizeBytes: m.sizeBytes,
-    // mmproj 只给路径（或 null）；投影器本身有几百 MB，绝不读内容。
-    mmproj: m.mmproj,
-  })),
-  presets: Object.entries(PRESETS).map(([k, v]) => ({
-    key: k, label: v.label, hint: v.hint, ctx: v.ctx, vision: v.vision,
-  })),
-  ctxSteps: CTX_STEPS,
-  kvTypes: KV_TYPES,
-  defaultKv: DEFAULT_KV,
-  // 仅作参考信息:本机观测到的显存分配天花板。**不要**拿它当溢出判据 ——
-  // 溢出的配置和满速的配置显存读数可以完全一样(见 config.js 的说明)。
-  vramCeilingMiB: VRAM_CEILING_MIB,
-  reasoning: Object.entries(REASONING).map(([k, v]) => ({
-    key: k, label: v.label, hint: v.hint, flag: v.flag,
-  })),
-  budgets: REASONING_BUDGETS.map((b) => ({
-    key: b.key, label: b.label, hint: b.hint, value: b.value,
-  })),
-  defaultBudget: DEFAULT_REASONING_BUDGET,
-  // 起始端口（不是"当前端口"）。运行中的真实端口从 status IPC 取 ——
-  // 界面用 s.port 更新状态栏与局域网直连地址。
-  port: serviceStatus().port || configuredBasePort(),
-  // 可选徽章信息：最近一次探测到的 llama-server 构建能力摘要。
-  // 只加字段，不改任何既有字段。
-  caps: capsSummary(lastCaps),
-}));
+ipcMain.handle('catalogue', () => {
+  // P4：先把目录/构建摘要算出来（catalogueEnvironment 会确保 initRuntime 已跑）。
+  // 旧字段一个不少；新增 modelRoots/suggestedModelRoot/buildRoots/buildBinary。
+  const dirs = catalogueEnvironment();
+  return {
+    // P2：来源是 initRuntime() 缓存的扫描目录（扫描根 + 旧配置合并）。
+    // 旧字段一个不少；新增 source/meta/sizeBytes/mmproj。
+    // meta 只是安全摘要（arch/ctx/层数/专家/思考/模板字节数），
+    // 绝不把 GGUF 原始 metadata（BigInt + 超大数组）带进 IPC。
+    models: runtimeModels().map((m) => ({
+      id: m.id,
+      name: m.name,
+      note: m.note,
+      file: m.file,
+      defaultPreset: m.defaultPreset,
+      present: m.present,
+      binPresent: m.binPresent,
+      warn: m.warn || null,
+      // 上下文滑块的边界,按 KV 精度分别给:
+      //   safeCtx  { q4_0: N, q8_0: M } —— 本机实测"不会溢出"的值(见 config.js)
+      //   maxCtx   模型自身声明的上限
+      // safeCtx 比 maxCtx 小,而且随 KV 精度变化(精度越高 KV 越大、装得越少),
+      // 所以整对象传过去,由界面按当前选中的 KV 精度取值 —— 这样拖动 KV 选择器
+      // 时安全区能立刻联动,不需要再走一次 IPC。
+      safeCtx: m.safeCtx || null,
+      maxCtx: m.maxCtx || null,
+      probeTps: m.probeTps || null,
+      // 混合注意力里"多少层带 KV cache" —— 界面用它生成解释文案,
+      // 而不是把某一种模型的层数写死在 HTML 里(那已经错过一次了)。
+      kvLayers: m.kvLayers || null,
+      // ---- P2 新增（只加字段，不改既有语义）----
+      source: m.source,
+      meta: m.meta,
+      sizeBytes: m.sizeBytes,
+      // mmproj 只给路径（或 null）；投影器本身有几百 MB，绝不读内容。
+      mmproj: m.mmproj,
+    })),
+    // ---- P4 新增（目录/构建摘要；全部 JSON 安全，不含 candidates 明细）----
+    modelRoots: dirs.modelRoots,
+    suggestedModelRoot: dirs.suggestedModelRoot,
+    buildRoots: dirs.buildRoots,
+    buildBinary: dirs.buildBinary,
+    presets: Object.entries(PRESETS).map(([k, v]) => ({
+      key: k, label: v.label, hint: v.hint, ctx: v.ctx, vision: v.vision,
+    })),
+    ctxSteps: CTX_STEPS,
+    kvTypes: KV_TYPES,
+    defaultKv: DEFAULT_KV,
+    // 仅作参考信息:本机观测到的显存分配天花板。**不要**拿它当溢出判据 ——
+    // 溢出的配置和满速的配置显存读数可以完全一样(见 config.js 的说明)。
+    vramCeilingMiB: VRAM_CEILING_MIB,
+    reasoning: Object.entries(REASONING).map(([k, v]) => ({
+      key: k, label: v.label, hint: v.hint, flag: v.flag,
+    })),
+    budgets: REASONING_BUDGETS.map((b) => ({
+      key: b.key, label: b.label, hint: b.hint, value: b.value,
+    })),
+    defaultBudget: DEFAULT_REASONING_BUDGET,
+    // 起始端口（不是"当前端口"）。运行中的真实端口从 status IPC 取 ——
+    // 界面用 s.port 更新状态栏与局域网直连地址。
+    port: serviceStatus().port || configuredBasePort(),
+    // 可选徽章信息：最近一次探测到的 llama-server 构建能力摘要。
+    // 只加字段，不改任何既有字段。
+    caps: capsSummary(lastCaps),
+  };
+});
 
 // 手动重新扫描模型目录（P2 不要求文件监听；界面需要时显式刷新）。
 // 返回摘要，不返回模型列表 —— 列表走 catalogue，避免两套结构。

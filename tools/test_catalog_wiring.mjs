@@ -9,6 +9,8 @@
 //   4. legacy（config.js）条目仍然全部在，id 保持旧值；
 //   5. startServer(scanId) 用动态端口 + 假 spawn 成功，argv 的 -m 指向扫描文件；
 //   6. stopServer 收干净、台账清空；refreshCatalog 可重扫。
+//   7. P4：catalogue 新增 modelRoots/suggestedModelRoot/buildRoots/buildBinary，
+//      以及 index.html/preload/main 的静态接线（徽章、引导面板、重新扫描）。
 //
 // 全部在独立临时目录里跑，结束时恢复环境变量并删目录。
 //
@@ -216,6 +218,34 @@ try {
   try { catJson = JSON.stringify(cat); } catch (e) { catJson = ''; }
   check('catalogue 可 JSON 序列化（无 BigInt）', catJson.length > 0);
 
+  // ---- P4：目录/构建摘要 -------------------------------------------------
+  check('catalogue.modelRoots 含扫描根',
+    Array.isArray(cat.modelRoots)
+      && cat.modelRoots.some((r) => samePath(r, MODELS_DIR)),
+    JSON.stringify(cat.modelRoots));
+  check('catalogue.buildRoots 是数组且含构建根',
+    Array.isArray(cat.buildRoots)
+      && cat.buildRoots.some((r) => samePath(r, BUILD_DIR)),
+    JSON.stringify(cat.buildRoots));
+  const suggested = cat.suggestedModelRoot;
+  check('catalogue.suggestedModelRoot 形状正确（root/source/candidates 数量）',
+    !!suggested
+      && typeof suggested.root === 'string' && suggested.root.length > 0
+      && typeof suggested.source === 'string'
+      && Number.isInteger(suggested.candidates) && suggested.candidates >= 0
+      && !Array.isArray(suggested.candidates),
+    suggested ? JSON.stringify(suggested) : '(null)');
+  const buildBinary = cat.buildBinary;
+  check('catalogue.buildBinary 形状正确（path:string|null / present:boolean）',
+    !!buildBinary
+      && (buildBinary.path === null || typeof buildBinary.path === 'string')
+      && typeof buildBinary.present === 'boolean',
+    buildBinary ? JSON.stringify(buildBinary) : '(null)');
+  check('catalogue.buildBinary.present 为 true 时 path 真实存在',
+    !!buildBinary && (!buildBinary.present
+      || (typeof buildBinary.path === 'string' && fs.existsSync(buildBinary.path))),
+    buildBinary ? String(buildBinary.path) : '(null)');
+
   const scan = cat.models.find((m) => samePath(m.file, scanFile));
   check('catalogue 里出现 scan 条目', !!scan, scan ? scan.id : '(没找到)');
   if (scan) {
@@ -315,6 +345,36 @@ try {
   check('catalogue:refresh 返回摘要且仍发现同一模型',
     refreshed.models === summary.models && refreshed.startable >= 1,
     `${refreshed.models} / ${refreshed.startable}`);
+
+  // ---- P4：UI / preload / main 静态接线 ---------------------------------
+  const html = fs.readFileSync(path.join(REPO, 'src', 'index.html'), 'utf8');
+  const guideIds = ['modelGuide', 'guideStats', 'guideMissing', 'guideRoot', 'guideBuild', 'btnRescan'];
+  const absentGuideIds = guideIds.filter((id) => !html.includes(`id="${id}"`));
+  check('index.html 包含缺失引导面板的全部 id',
+    absentGuideIds.length === 0, absentGuideIds.join(','));
+
+  const inlineScript = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)]
+    .map((m) => m[1]).join('\n');
+  const badgeHooks = ['modelBadgeItems', 'appendModelBadges', 'renderGuide', 'rescanCatalogue'];
+  check('index.html 内联脚本包含徽章/引导渲染函数',
+    badgeHooks.every((name) => inlineScript.includes(`function ${name}`)),
+    badgeHooks.filter((name) => !inlineScript.includes(`function ${name}`)).join(','));
+  check('index.html 有徽章样式与徽章容器',
+    html.includes('.badge {') && inlineScript.includes("wrap.className = 'badges'"));
+  const referenced = new Set([...inlineScript.matchAll(/\$\('([^']+)'\)/g)].map((m) => m[1]));
+  const missingRefs = [...referenced].filter((id) => !html.includes(`id="${id}"`));
+  check('内联脚本 $(id) 引用的元素都存在',
+    missingRefs.length === 0, missingRefs.join(','));
+
+  const preloadSrc = fs.readFileSync(path.join(REPO, 'src', 'preload.js'), 'utf8');
+  check('preload 暴露 refreshCatalogue → catalogue:refresh',
+    /refreshCatalogue\s*:\s*\(\)\s*=>\s*ipcRenderer\.invoke\('catalogue:refresh'\)/.test(preloadSrc));
+  const mainSrc = fs.readFileSync(path.join(REPO, 'src', 'main.js'), 'utf8');
+  check('main.js 注册 catalogue:refresh IPC',
+    /ipcMain\.handle\('catalogue:refresh'/.test(mainSrc));
+  check('main.js catalogue 返回 P4 四个新字段',
+    ['modelRoots', 'suggestedModelRoot', 'buildRoots', 'buildBinary']
+      .every((key) => new RegExp(`\\b${key}\\s*:`).test(mainSrc)));
 
   let unknownErr = null;
   const spawnedBeforeUnknown = spawned;
