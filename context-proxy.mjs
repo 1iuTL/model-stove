@@ -30,6 +30,13 @@
 //   PROXY_RATE_CAPACITY        按 IP 的令牌桶容量，默认 60
 //   PROXY_RATE_REFILL_PER_SEC  每秒补充的令牌数，默认 2
 //   PROXY_STATE_DIR            devices.json / audit.jsonl 与日志、状态文件的目录
+//
+// P1 管理端点（都需要 /_bridge token；未设 PROXY_TOKEN 时免鉴权）:
+//   POST /_security/pairing  生成一次性 6 位配对码（手机随后用 /_pair 兑换）
+//   POST /_security/issue    本机直接签发设备密钥（不经配对；key 只返回一次）
+//   GET  /_security/devices  列出设备（不含明文 key/hash）
+//   POST /_security/revoke   吊销设备
+//   POST /_security/rotate   轮换设备密钥（新 key 只返回一次）
 import http from 'node:http'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -700,6 +707,15 @@ async function handlePairRequest(req, res) {
   })
 }
 
+/**
+ * 设备名归一化：非字符串/空白回退到默认名，按 Unicode 字符截断到 64。
+ * 设备名会进列表与审计 detail，这里只做长度约束，不承担转义职责。
+ */
+function normalizeDeviceName(value) {
+  const text = typeof value === 'string' ? value.trim() : ''
+  return [...(text || '手动签发设备')].slice(0, 64).join('')
+}
+
 /** /_security/*：管理端点，必须通过 /_bridge 的 token 规则。 */
 async function handleSecurityRequest(req, res, urlPath) {
   if (!bridgeAuthorized(req)) {
@@ -722,6 +738,45 @@ async function handleSecurityRequest(req, res, urlPath) {
       return
     }
     sendSecurityJson(res, 200, { ok: true, devices })
+    return
+  }
+
+  if (urlPath === '/_security/issue') {
+    if (req.method !== 'POST') {
+      sendSecurityJson(res, 405, { ok: false, error: 'method_not_allowed' })
+      return
+    }
+    let body
+    try {
+      body = await readJsonObject(req)
+    } catch (e) {
+      if (e && e.code === 'BODY_TOO_LARGE') throw e
+      sendSecurityJson(res, 400, { ok: false, error: 'invalid_json' })
+      return
+    }
+    const name = normalizeDeviceName(body.name)
+    let issued
+    try {
+      issued = deviceRegistry.issueDevice({ name })
+    } catch (e) {
+      log(`签发设备密钥失败: ${e.message}`)
+      sendSecurityJson(res, 500, { ok: false, error: 'internal' })
+      return
+    }
+    // 审计用独立的 issue 事件（与"手机用配对码兑换"的 pair_create 区分）；
+    // 只记设备 id 与静态路由，不写明文 key/请求体。
+    auditEvent('issue', {
+      deviceId: issued.id,
+      ip: clientIp(req),
+      detail: 'POST /_security/issue',
+    })
+    // 明文 key 只在这里出现一次：不落盘、不写日志、不写审计。
+    sendSecurityJson(res, 200, {
+      ok: true,
+      deviceId: issued.id,
+      key: issued.key,
+      name: issued.name,
+    })
     return
   }
 

@@ -5,6 +5,7 @@
 //
 // 覆盖（对应任务里的 1-8 项）：
 //   1. /_security/pairing 需要 bridge token；200 返回 6 位 code；审计 pair_create
+//   1b. /_security/issue 需要 bridge token；key 可用、只出现一次、设备名截断
 //   2. /_pair 公开兑换（单次）；成功/失败都写审计，失败响应统一 401
 //   3. /v1 设备鉴权：无 key 401、x-device-key/Bearer 200、错误 key 401；
 //      上游只看到 UPSTREAM_KEY，看不到设备 key
@@ -315,6 +316,58 @@ try {
     && !('key' in listed1) && !('hash' in listed1)
     && !JSON.stringify(list1Body).includes(key1),
     `HTTP ${list1.status}`);
+
+  // ---- 1b. 直接签发（/_security/issue，同样受 bridge token 保护）----
+  const issueNoToken = await postJson({
+    port: portA, path: '/_security/issue', body: { name: '无 token' },
+  });
+  check('无 bridge token 签发设备 → 401',
+    issueNoToken.status === 401 && jsonOf(issueNoToken)?.error === 'unauthorized',
+    `HTTP ${issueNoToken.status}`);
+
+  const longName = '设备'.repeat(40); // 80 个字符，验证服务端截断
+  const issued = await postJson({
+    port: portA, path: '/_security/issue', headers: bridgeHeaders, body: { name: longName },
+  });
+  const issuedBody = jsonOf(issued);
+  check('带 token 签发设备 → 200', issued.status === 200, `HTTP ${issued.status}`);
+  check('签发返回 deviceId + 64 位 hex key + name',
+    !!issuedBody
+    && /^dev_[0-9a-f]+$/.test(issuedBody.deviceId)
+    && /^[0-9a-f]{64}$/.test(issuedBody.key)
+    && issuedBody.ok === true,
+    issuedBody ? issuedBody.deviceId : issued.body.slice(0, 80));
+  check('设备名截断到 64 个字符',
+    !!issuedBody && [...issuedBody.name].length === 64,
+    issuedBody ? String([...issuedBody.name].length) : '');
+  check('签发响应带 no-store', issued.headers['cache-control'] === 'no-store',
+    String(issued.headers['cache-control']));
+  check('审计出现 issue', await waitAuditEvent(a.stateDir, 'issue'));
+
+  const issuedKey = issuedBody.key;
+  const issuedChat = await postJson({
+    port: portA,
+    path: '/v1/chat/completions',
+    headers: { 'x-device-key': issuedKey },
+    body: CHAT_BODY,
+  });
+  check('用签发出来的 key 访问 /v1 → 200', issuedChat.status === 200, `HTTP ${issuedChat.status}`);
+
+  const issuedList = await request({ port: portA, path: '/_security/devices', headers: bridgeHeaders });
+  const issuedListBody = jsonOf(issuedList);
+  const issuedListed = (issuedListBody?.devices || []).find((d) => d.id === issuedBody.deviceId);
+  check('签发设备出现在列表且列表不含明文 key',
+    !!issuedListed
+    && !('key' in issuedListed)
+    && !JSON.stringify(issuedListBody).includes(issuedKey),
+    `HTTP ${issuedList.status}`);
+
+  const badIssueJson = await postJson({
+    port: portA, path: '/_security/issue', headers: bridgeHeaders, body: '{oops',
+  });
+  check('签发端点 JSON 解析失败 → 400',
+    badIssueJson.status === 400 && jsonOf(badIssueJson)?.error === 'invalid_json',
+    `HTTP ${badIssueJson.status}`);
 
   // ---- 3. /v1 设备鉴权 ----
   const htmlA = await request({ port: portA, path: '/' });
