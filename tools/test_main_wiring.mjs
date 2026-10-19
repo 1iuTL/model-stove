@@ -157,6 +157,21 @@ try {
 
   const ledger = ports.readLedger(path.join(TMP, 'logs', 'running-pids.json'));
   check('台账已清空', ledger.length === 0, JSON.stringify(ledger));
+
+  // P1 安全护栏：局域网模式没有 API Key 必须在 spawn 之前就被拒绝。
+  // 这里不依赖 capabilities（假 exe 探测必然失败 → caps 未知），正好验证
+  // “caps 未知时也要求 Key”这条兜底规则。
+  const spawnedBefore = spawned;
+  let lanErr = null;
+  try {
+    await main.__test.startServer('__wiring__', 'text-32k', null, true, null, null, 'q4_0');
+  } catch (e) {
+    lanErr = e;
+  }
+  check('LAN 无 API Key 启动被拒绝', !!lanErr && /API Key/.test(lanErr.message),
+    lanErr ? lanErr.message.split('\n')[0] : '(没有被拒绝)');
+  check('被拒绝时没有 spawn 新进程', spawned === spawnedBefore,
+    spawned === spawnedBefore ? '' : '竟然又起了一个进程');
 } catch (e) {
   check('测试执行无异常', false, e && e.message ? e.message : String(e));
   console.log(e && e.stack ? e.stack : e);
