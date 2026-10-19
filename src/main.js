@@ -17,10 +17,11 @@ const http = require('http');
 const net = require('net');
 const crypto = require('crypto');
 
-const { MODELS, PRESETS, REASONING, REASONING_BUDGETS, DEFAULT_REASONING_BUDGET, buildArgs, PROXY_PORT, PROXY_BASE, CTX_STEPS, VRAM_CEILING_MIB, KV_TYPES, DEFAULT_KV, safeCtxFor, resolveKv } = require('./config');
+const { MODELS, PRESETS, REASONING, REASONING_BUDGETS, DEFAULT_REASONING_BUDGET, buildArgs, BIN, PROXY_PORT, PROXY_BASE, CTX_STEPS, VRAM_CEILING_MIB, KV_TYPES, DEFAULT_KV, safeCtxFor, resolveKv } = require('./config');
 const { probeSpeed } = require('./probe');
 const settings = require('./settings');
 const { createPaths, ensureDirs } = require('./core/paths');
+const { discoverCatalog, importLegacyConfig } = require('./core/catalog');
 const { Supervisor } = require('./core/supervisor');
 const ports = require('./core/ports');
 const { loadCapabilities } = require('./core/capabilities');
@@ -45,6 +46,16 @@ let supervisor = null;
 // 最近一次能力探测结果（默认只在启动某模型时更新）。给 status/catalogue 的
 // 徽章摘要用；原始 Set 不直接跨 IPC。
 let lastCaps = null;
+
+// P2 模型目录缓存：扫描 paths.modelRoots + 合并 config.MODELS 的结果。
+// 只在 initRuntime() 之后有值；catalogue / startServer / status 都从这里取。
+// 注意 MODELS 必须**在 initRuntime 时**读取，不能模块加载时就固化：
+// tools/test_main_wiring.mjs 会在 require main.js 之前往 cfg.MODELS 里 push
+// 假模型，提前固化会漏掉它。
+let lastCatalog = null;
+// 构建根里 llama-server.exe 的解析结果（key = buildRoots 序列化）。
+// 目录没变时不重复 readdir；refreshCatalog() 会清掉它。
+let buildBinCache = null;
 
 // 兼容旧模块级常量：在 ready 之前调用 runCapture/防火墙自检时仍有一个可写的日志目录。
 // ready 之后会被替换成 paths.logsDir。
@@ -87,6 +98,12 @@ function initRuntime() {
   appendShellLog(`[shell] 日志目录: ${paths.logsDir}`);
   const badSources = (paths.config.sources || []).filter((s) => s && s.file && s.loaded === false);
   for (const s of badSources) appendShellLog(`[shell] 配置读不出来: ${s.file} (${s.error || '未知错误'})`);
+
+  // P2：扫描模型目录并合并旧配置。放在这里（而不是模块顶层）有两个原因：
+  //   1) modelRoots/buildRoots 要等 createPaths 读完配置与环境变量才确定；
+  //   2) 测试会在 require 之后、ready 之前修改 MODELS，太早读会漏。
+  // 目录扫描失败只会回退成“仅 legacy”，绝不阻断应用启动。
+  loadCatalog();
   return paths;
 }
 
@@ -225,6 +242,269 @@ function modelExists(model) {
 
 function binExists(model) {
   try { return fs.existsSync(model.bin); } catch { return false; }
+}
+
+// ------------------------------------------------------------ 模型目录（P2）
+//
+// 模型清单不再只来自 config.js 里那 6 条硬编码绝对路径：
+//   initRuntime() 扫描 paths.modelRoots → 解析 GGUF 头 → 合并旧 MODELS，
+//   结果缓存在 lastCatalog；catalogue / startServer / status 都从这里取。
+//
+// 两条设计约束：
+//   1) 扫描失败不能阻断应用：任何意外都回退成“仅 legacy 配置”；
+//   2) MODELS 必须在 initRuntime 时才读（见模块顶部 lastCatalog 的注释）。
+
+/** 文件是否存在（不抛异常）。 */
+function fileExists(file) {
+  try { return !!file && fs.existsSync(file); } catch { return false; }
+}
+
+/** 数字字段收敛：只接受有限数字/数字字符串，其余给 null。 */
+function numberOrNull(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'string' && value.trim()) {
+    const n = Number(value.trim());
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+/** 扫描整体失败时的回退：只把旧配置映射成 catalog，保证界面还有模型可选。 */
+function legacyOnlyCatalog() {
+  try {
+    return {
+      models: importLegacyConfig(MODELS),
+      roots: [],
+      warnings: [],
+      scannedAt: new Date().toISOString(),
+      fallback: true,
+    };
+  } catch (e) {
+    appendShellLog(`[shell] 旧配置回退失败: ${e.message}`);
+    return {
+      models: [], roots: [], warnings: [], scannedAt: new Date().toISOString(), fallback: true,
+    };
+  }
+}
+
+/**
+ * 扫描模型根 + 合并旧配置，写入 lastCatalog。
+ *
+ * discoverCatalog() 本身不抛异常；这里再兜一层，任何意外都回退到仅 legacy，
+ * 并照常写日志，方便用户从 shell.log 判断“为什么列表里只有旧模型”。
+ */
+function loadCatalog() {
+  let catalog;
+  try {
+    catalog = discoverCatalog({
+      roots: (paths && paths.modelRoots) || [],
+      // 必须在调用时取 MODELS（不能模块加载时固化）——测试会提前 push 假模型。
+      legacyModels: MODELS,
+    });
+    if (!catalog || !Array.isArray(catalog.models)) throw new Error('目录结果格式不正确');
+  } catch (e) {
+    appendShellLog(`[shell] 模型目录扫描失败（回退到旧配置）: ${e.message}`);
+    catalog = legacyOnlyCatalog();
+    catalog.warnings = [{ code: 'catalog-failed', message: e.message }];
+  }
+  lastCatalog = catalog;
+  logCatalogSummary();
+  return catalog;
+}
+
+/** 取目录缓存；没有就初始化（仅测试/异常时序会走到这里）。 */
+function ensureCatalog() {
+  if (lastCatalog) return lastCatalog;
+  if (!paths) initRuntime();
+  if (!lastCatalog) loadCatalog();
+  return lastCatalog;
+}
+
+/**
+ * 重新扫描一次模型目录（IPC / __test 可调）。
+ * 同时清掉构建路径缓存 —— 用户可能刚放进一个新的 llama-server。
+ */
+function refreshCatalog() {
+  if (!paths) initRuntime();
+  buildBinCache = null;
+  loadCatalog();
+  return catalogSummary();
+}
+
+/** 给日志/__test 的目录摘要（不含任何 GGUF 原始 metadata）。 */
+function catalogSummary() {
+  const cat = ensureCatalog();
+  const models = Array.isArray(cat.models) ? cat.models : [];
+  const runtime = runtimeModels(); // ensureCatalog 已命中缓存，不会重复扫描
+  return {
+    scannedAt: cat.scannedAt || null,
+    fallback: !!cat.fallback,
+    roots: (cat.roots || []).slice(),
+    warnings: (cat.warnings || []).slice(),
+    models: models.length,
+    startable: runtime.filter((m) => m.present && m.binPresent).length,
+    // legacy 条目里文件不存在的数量（旧配置 6 条里通常缺 5 条左右）。
+    legacyMissing: models.filter((m) => m.source === 'legacy' && !m.available).length,
+  };
+}
+
+/** 固定格式的目录日志：一行摘要 + 每条 warning 一行。 */
+function logCatalogSummary() {
+  const s = catalogSummary();
+  appendShellLog(`[shell] 模型目录: 扫描 ${s.roots.length} 个根，发现 ${s.models} 条模型`
+    + `（${s.startable} 可启动），${s.legacyMissing} 条 legacy 缺失`);
+  for (const w of s.warnings) {
+    appendShellLog(`[shell] 模型目录警告${w.code ? ` [${w.code}]` : ''}: `
+      + `${w.message || w.file || w.root || '未知'}`);
+  }
+}
+
+/**
+ * 在构建根里找 llama-server.exe：先根目录，再按名称排序的一层子目录。
+ * 结果按 buildRoots 缓存，避免每次 status 轮询都 readdir。
+ */
+function findBuildBin() {
+  const roots = (paths && paths.buildRoots) || [];
+  const key = roots.join('\n');
+  if (buildBinCache && buildBinCache.key === key) return buildBinCache.file;
+
+  let found = null;
+  for (const root of roots) {
+    const direct = path.join(root, 'llama-server.exe');
+    if (fileExists(direct)) { found = direct; break; }
+
+    let dirents = [];
+    try { dirents = fs.readdirSync(root, { withFileTypes: true }); } catch { continue; }
+    const names = dirents
+      .filter((d) => d && typeof d.isDirectory === 'function' && d.isDirectory())
+      .map((d) => String(d.name))
+      .sort((a, b) => {
+        const la = a.toLowerCase();
+        const lb = b.toLowerCase();
+        return la < lb ? -1 : (la > lb ? 1 : 0);
+      });
+    for (const name of names) {
+      const candidate = path.join(root, name, 'llama-server.exe');
+      if (fileExists(candidate)) { found = candidate; break; }
+    }
+    if (found) break;
+  }
+
+  buildBinCache = { key, file: found };
+  return found;
+}
+
+/** config.BIN 的检索顺序：stock → prism → fast（与 config.js 的推荐一致）。 */
+const CONFIG_BIN_ORDER = ['stock', 'prism', 'fast'];
+
+/** config.BIN 里第一个真实存在的构建；都没有返回 null。 */
+function firstConfigBin() {
+  for (const name of CONFIG_BIN_ORDER) {
+    const file = BIN && BIN[name];
+    if (file && fileExists(file)) return file;
+  }
+  return null;
+}
+
+/**
+ * 解析某个模型该用哪个 llama-server。
+ *
+ * 顺序（scan-only 模型能启动的关键在第 2 步）：
+ *   1. overrides.bin —— 旧配置里用户实测选定的构建，文件还在就用；
+ *   2. paths.buildRoots（MODEL_STOVE_BUILDS / config.builds.roots）里的
+ *      llama-server.exe（根目录或一层子目录）；
+ *   3. config.BIN 里第一个真实存在的构建。
+ * 都没有返回 null，由 runtimeModels() 标 binPresent:false + warn。
+ */
+function resolveRuntimeBin(overrides) {
+  const explicit = overrides && typeof overrides.bin === 'string' && overrides.bin.trim()
+    ? path.resolve(overrides.bin.trim())
+    : null;
+  if (explicit && fileExists(explicit)) return explicit;
+
+  const fromBuilds = findBuildBin();
+  if (fromBuilds) return fromBuilds;
+
+  return firstConfigBin();
+}
+
+/**
+ * 把 catalog 条目映射成启动链路与界面都兼容的模型对象。
+ *
+ * - id：旧条目沿用 legacyId（qwen38distill-abl 等旧 id 不变），
+ *   scan-only 条目用 catalog 的 sha1 id；
+ * - 旧字段（temp/topP/topK/extraArgs/safeCtx/maxCtx/probeTps/kvLayers/
+ *   defaultPreset/bin/...）全部从 entry.overrides 取 —— catalog 已把
+ *   config.js 的字段收在那里，且合并时显式覆盖优先；
+ * - meta 只放安全摘要：绝不把 readGgufMetadata().metadata 塞进 IPC
+ *   （里面有 BigInt，也可能有几十万条 tokenizer 词条）。
+ */
+function runtimeModels() {
+  const catalog = ensureCatalog();
+  return (catalog.models || []).map((entry) => {
+    const o = (entry && entry.overrides) || {};
+    const legacyId = (typeof entry.legacyId === 'string' && entry.legacyId)
+      || (typeof o.legacyId === 'string' && o.legacyId)
+      || null;
+    const id = legacyId || entry.id;
+    const file = entry.file || null;
+    const bin = resolveRuntimeBin(o);
+    const present = !!file && modelExists({ file });
+    const mmprojRaw = entry.mmproj || (typeof o.mmproj === 'string' ? o.mmproj : null);
+
+    const experts = entry.experts && typeof entry.experts === 'object'
+      ? {
+        count: numberOrNull(entry.experts.count),
+        used: numberOrNull(entry.experts.used),
+        shared: numberOrNull(entry.experts.shared),
+      }
+      : null;
+
+    const meta = {
+      arch: entry.arch || null,
+      ctxTrain: numberOrNull(entry.ctxTrain),
+      blockCount: numberOrNull(entry.blockCount),
+      experts,
+      thinking: !!entry.thinking,
+      chatTemplateBytes: numberOrNull(entry.chatTemplateBytes) || 0,
+    };
+
+    // 文件在、但没有可用构建 —— 这是“点启动必然失败”的配置，提前在卡片上说清。
+    const warn = (present && !bin)
+      ? '未找到 llama-server 构建：请设置 MODEL_STOVE_BUILDS，或在 config.js 的 BIN 里放一个 llama-server.exe'
+      : null;
+
+    return {
+      id,
+      name: entry.name || id,
+      note: (typeof o.note === 'string' && o.note.trim())
+        ? o.note
+        : (typeof entry.note === 'string' ? entry.note : null),
+      file,
+      bin,
+      mmproj: mmprojRaw ? path.resolve(String(mmprojRaw)) : null,
+      defaultPreset: (typeof o.defaultPreset === 'string' && PRESETS[o.defaultPreset])
+        ? o.defaultPreset
+        : 'text-64k',
+      temp: numberOrNull(o.temp),
+      topP: numberOrNull(o.topP),
+      topK: numberOrNull(o.topK),
+      extraArgs: Array.isArray(o.extraArgs) ? o.extraArgs.slice() : null,
+      safeCtx: (o.safeCtx && typeof o.safeCtx === 'object')
+        ? { ...o.safeCtx }
+        : numberOrNull(o.safeCtx),
+      maxCtx: numberOrNull(o.maxCtx),
+      probeTps: numberOrNull(o.probeTps),
+      kvLayers: (o.kvLayers && typeof o.kvLayers === 'object') ? { ...o.kvLayers } : null,
+      present,
+      binPresent: !!bin,
+      source: entry.source === 'legacy' ? 'legacy' : 'scan',
+      legacyId,
+      meta,
+      sizeBytes: numberOrNull(entry.sizeBytes),
+      warn,
+    };
+  });
 }
 
 // ------------------------------------------------------------ 启动速度探针
@@ -374,11 +654,15 @@ async function stopServer() {
 async function startServer(modelId, presetKey, reasoningKey, lanMode, budgetKey, ctx, kv) {
   await stopServer();
 
-  const model = MODELS.find((m) => m.id === modelId);
+  // P2：模型不再从 config.MODELS 直接取 —— 目录缓存里的运行时对象才有
+  // legacy 映射后的 id 与解析出的 llama-server 路径（scan-only 模型也能启动）。
+  const model = runtimeModels().find((m) => m.id === modelId);
   if (!model) throw new Error(`未知的模型标识: ${modelId}`);
   if (!PRESETS[presetKey]) throw new Error(`未知的预设: ${presetKey}`);
   if (!modelExists(model)) throw new Error(`模型文件不存在:\n${model.file}`);
-  if (!binExists(model)) throw new Error(`llama-server 不存在:\n${model.bin}`);
+  if (!model.bin || !binExists(model)) {
+    throw new Error(`llama-server 不存在:\n${model.bin || '(未找到任何 llama-server 构建)'}`);
+  }
 
   const apiKey = (settings.readSettings().apiKey || '').trim();
   const overrides = { ctx, kv };
@@ -650,14 +934,18 @@ function createWindow() {
 // --------------------------------------------------------------------- IPC
 
 ipcMain.handle('catalogue', () => ({
-  models: MODELS.map((m) => ({
+  // P2：来源是 initRuntime() 缓存的扫描目录（扫描根 + 旧配置合并）。
+  // 旧字段一个不少；新增 source/meta/sizeBytes/mmproj。
+  // meta 只是安全摘要（arch/ctx/层数/专家/思考/模板字节数），
+  // 绝不把 GGUF 原始 metadata（BigInt + 超大数组）带进 IPC。
+  models: runtimeModels().map((m) => ({
     id: m.id,
     name: m.name,
     note: m.note,
     file: m.file,
     defaultPreset: m.defaultPreset,
-    present: modelExists(m),
-    binPresent: binExists(m),
+    present: m.present,
+    binPresent: m.binPresent,
     warn: m.warn || null,
     // 上下文滑块的边界,按 KV 精度分别给:
     //   safeCtx  { q4_0: N, q8_0: M } —— 本机实测"不会溢出"的值(见 config.js)
@@ -671,6 +959,12 @@ ipcMain.handle('catalogue', () => ({
     // 混合注意力里"多少层带 KV cache" —— 界面用它生成解释文案,
     // 而不是把某一种模型的层数写死在 HTML 里(那已经错过一次了)。
     kvLayers: m.kvLayers || null,
+    // ---- P2 新增（只加字段，不改既有语义）----
+    source: m.source,
+    meta: m.meta,
+    sizeBytes: m.sizeBytes,
+    // mmproj 只给路径（或 null）；投影器本身有几百 MB，绝不读内容。
+    mmproj: m.mmproj,
   })),
   presets: Object.entries(PRESETS).map(([k, v]) => ({
     key: k, label: v.label, hint: v.hint, ctx: v.ctx, vision: v.vision,
@@ -695,6 +989,10 @@ ipcMain.handle('catalogue', () => ({
   // 只加字段，不改任何既有字段。
   caps: capsSummary(lastCaps),
 }));
+
+// 手动重新扫描模型目录（P2 不要求文件监听；界面需要时显式刷新）。
+// 返回摘要，不返回模型列表 —— 列表走 catalogue，避免两套结构。
+ipcMain.handle('catalogue:refresh', () => refreshCatalog());
 
 // ------------------------------------------------------------------ 设置 / 局域网
 
@@ -763,7 +1061,8 @@ ipcMain.handle('status', async () => {
     try { ctx = JSON.parse(slots.body)[0]?.n_ctx ?? null; } catch {}
   }
   if (!ctx) ctx = current.ctx || null;
-  const model = MODELS.find((m) => m.id === current.modelId) || null;
+  // modelId 是运行时 id（legacy 条目映射回旧 id），从目录缓存里取名字与摘要。
+  const model = runtimeModels().find((m) => m.id === current.modelId) || null;
   const managed = st.state === 'ready' && !!st.pid;
   return {
     running: !!health.ok,
@@ -788,6 +1087,8 @@ ipcMain.handle('status', async () => {
     url: health.ok ? base : null,
     // 可选徽章信息（version/build/flags 数）。既有字段不变。
     caps: capsSummary(lastCaps),
+    // P2：当前模型的安全摘要（可选；没有模型时为 null）。
+    meta: model ? model.meta : null,
   };
 });
 
@@ -1566,4 +1867,9 @@ module.exports.__test = {
   loadCapabilities, buildStartArgs, classifyStartupError, planRetry,
   capsSummary,
   caps: () => capsSummary(lastCaps),
+  // P2：目录缓存（摘要 / 重新扫描 / 运行时模型列表）。测试用来核对
+  // “扫描结果 → 启动链路”的映射，不需要走 Electron IPC。
+  catalog: () => catalogSummary(),
+  refreshCatalog,
+  runtimeModels,
 };
