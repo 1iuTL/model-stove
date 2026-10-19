@@ -14,7 +14,10 @@
   ],
   "license": "MIT",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "test": "node --test \"tests/*.test.mjs\"",
+    "test:argv": "node --test tests/argv-snapshot.test.mjs tests/argv-invariants.test.mjs",
+    "gen:argv": "node tools/gen_argv_baseline.mjs"
   },
   "devDependencies": {
     "electron": "^43.4.0"
