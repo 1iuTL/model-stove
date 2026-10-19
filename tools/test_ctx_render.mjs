@@ -156,13 +156,16 @@ ok(val.classList.contains('over'), '128K 对 q8_0 越界(对 q4_0 却是安全�
 ok(note.innerHTML.includes('q8_0'), `警告文案点出当前精度 = ${/已超过 <b>([^<]+)<\/b>/.exec(note.innerHTML)?.[1]}`);
 console.log('');
 
-console.log('--- 场景 4:切到三元版(KV 保持 q8_0,上限只剩 48K)---');
+console.log('--- 场景 4:切到三元版(KV 保持 q8_0,预设 64K 被安全上限夹到 48K)---');
 T.setModel('ternary');
 T.setCtx(null);
 T.setPreset('text-64k');
 T.render();
-ok(val.textContent.includes('64K'), `切模型后回到预设值 = "${val.textContent}"`);
-ok(val.classList.contains('over'), '64K 对三元版 + q8_0(上限 48K)越界 —— 分模型判定正确');
+// 预期与 config.js 的 buildArgs() 一致：**预设来源**的 ctx 要按当前 KV 精度夹到
+// 实测安全上限（三元版 q8_0 = 48K）。以前这里期望"显示 64K 并标越界"，那是
+// P1 之前的旧行为；若界面显示 64K 而实际以 48K 启动，才会出现对不上的状态。
+ok(val.textContent.includes('48K'), `切模型后预设值被夹到安全上限 = "${val.textContent}"`);
+ok(!val.classList.contains('over'), '夹到安全上限后不再显示越界（与 buildArgs 的夹紧一致）');
 // (49152-8192)/(262144-8192) = 16.13%
 ok(range.style.getPropertyValue('--safe') === '16.1%',
    `安全区色标 = ${range.style.getPropertyValue('--safe')} (期望 16.1%)`);
