@@ -45,6 +45,18 @@ contextBridge.exposeInMainWorld('shell', {
   /** 开关自动上下文压缩。 */
   setCompression: (enabled) => ipcRenderer.invoke('proxy:setCompression', enabled),
 
+  // ---- P1 设备访问（局域网）----
+  /** 本机直接签发设备密钥。key 只返回这一次，界面不要写 localStorage/日志。 */
+  securityIssue: (name) => ipcRenderer.invoke('security:issue', { name }),
+  /** 生成一次性 6 位配对码（手机在 /_pair 兑换）。 */
+  securityPairing: () => ipcRenderer.invoke('security:pairing'),
+  /** 列出已签发设备（不含明文 key/hash）。 */
+  securityDevices: () => ipcRenderer.invoke('security:devices'),
+  /** 吊销设备；之后该设备的 key 立即失效。 */
+  securityRevoke: (id) => ipcRenderer.invoke('security:revoke', { id }),
+  /** 轮换设备密钥；旧 key 立即失效，新 key 只返回这一次。 */
+  securityRotate: (id) => ipcRenderer.invoke('security:rotate', { id }),
+
   /** 订阅状态变更(服务意外退出时主进程会通知)。 */
   onStateChanged: (cb) => {
     const handler = () => cb();

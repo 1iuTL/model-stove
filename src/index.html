@@ -118,6 +118,24 @@
   .lanurl button {
     width: auto; flex: 0 0 auto; padding: 3px 8px; font-size: 11px; font-weight: 400;
   }
+
+  /* 设备访问（局域网）：一次性密钥/配对码与设备列表 */
+  #deviceOnceBox.hidden, #pairingBox.hidden { display: none; }
+  #deviceOnceBox code, #pairingBox code {
+    display: block; margin-top: 4px; padding: 5px 6px; border-radius: 4px;
+    background: #10131a; color: #f0d089; font-size: 11px; line-height: 1.5;
+    word-break: break-all; user-select: all;
+  }
+  #pairingBox code { font-size: 15px; letter-spacing: 2px; }
+  #deviceList .dev {
+    background: #10131a; border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px 8px; margin-top: 5px; font-size: 11px; line-height: 1.5;
+  }
+  #deviceList .dev .row1 { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  #deviceList .dev code { color: var(--dim); font-size: 10.5px; }
+  #deviceList .dev .meta { color: var(--dim); font-size: 10.5px; margin-top: 2px; }
+  #deviceList .dev button.mini { margin-top: 4px; }
+  #deviceList .dev .tag.revoked { color: var(--warn); border: 1px solid #5a4a1a; border-radius: 3px; padding: 0 4px; font-size: 10px; }
   #settings .warn, #modelGuide .warn {
     background: #2a1f10; border: 1px solid #5a4a1a; color: #e8c46a;
     border-radius: 6px; padding: 7px 9px; font-size: 11px; line-height: 1.5;
@@ -361,6 +379,27 @@
           <li>手机扫上面的码或手输地址</li>
           <li>首次打开会要 API Key,填一次即可</li>
         </ol>
+      </div>
+
+      <div class="sec">
+        <div class="h">设备访问（局域网）
+          <span class="spacer"></span>
+        </div>
+        <label class="opt" style="padding:4px 0">
+          <input type="checkbox" id="optDeviceAuth" />
+          <span class="txt">
+            <b>启用设备密钥（局域网客户端必须配对）</b>
+            <span>关闭 = 现有行为；开启后手机在 llama UI 的 API Key 输入框里粘贴设备密钥。</span>
+          </span>
+        </label>
+        <div class="btnrow">
+          <button id="btnIssueDevice" class="mini">生成设备密钥</button>
+          <button id="btnPairing" class="mini">生成配对码</button>
+        </div>
+        <div id="deviceHint" class="note"></div>
+        <div id="deviceOnceBox" class="warn hidden"></div>
+        <div id="pairingBox" class="warn hidden"></div>
+        <div id="deviceList"></div>
       </div>
 
       <div class="sec">
@@ -1310,7 +1349,7 @@ async function doStop() {
 
 // ------------------------------------------------------------------ 设置面板
 
-let SETTINGS = { apiKey: '', lanMode: false, probe: true, keepServerOnClose: true, addresses: [] };
+let SETTINGS = { apiKey: '', lanMode: false, probe: true, keepServerOnClose: true, deviceAuth: false, addresses: [] };
 
 /**
  * 重画局域网地址列表。
@@ -1435,12 +1474,113 @@ async function loadSettingsToUi() {
   // 主进程缺省返回 true(没设过 = 开),这里如实反映,不要自己再兜一层默认。
   $('optProbe').checked = SETTINGS.probe !== false;
   $('optKeepServerOnClose').checked = SETTINGS.keepServerOnClose !== false;
+  $('optDeviceAuth').checked = SETTINGS.deviceAuth === true;
   renderLan();
+  renderDeviceHint();
 }
 
 async function refreshNet() {
   SETTINGS.addresses = await window.shell.addresses();
   renderLan();
+}
+
+// ------------------------------------------------------ 设备访问（局域网 / P1）
+
+/** 设备列表缓存。只在内存里，刷新页面会重新拉取；没有任何持久化。 */
+let DEVICES = [];
+
+/** 代理离线时禁用签发/配对按钮，并把原因说清楚，避免"点了没反应"。 */
+function renderDeviceHint() {
+  const online = !!(PROXY && PROXY.online);
+  $('btnIssueDevice').disabled = !online;
+  $('btnPairing').disabled = !online;
+  if (!online) {
+    $('deviceHint').textContent = '代理未在运行：设备管理需要代理在线，请先在「任务档位」里点「启动代理」。';
+  } else if (!SETTINGS.deviceAuth) {
+    $('deviceHint').textContent = '设备密钥当前关闭：局域网客户端按现有方式访问（用 API Key）。开启后需重启代理，本页会自动重启。';
+  } else {
+    $('deviceHint').textContent = '设备密钥已启用：手机在 llama UI 的 API Key 输入框里粘贴设备密钥。';
+  }
+}
+
+function deviceTime(ts) {
+  return ts ? new Date(ts).toLocaleString() : '—';
+}
+
+/** 渲染设备列表。设备名来自用户输入，必须用 textContent，不能拼 innerHTML。 */
+function renderDeviceList() {
+  const box = $('deviceList');
+  box.innerHTML = '';
+  if (!(PROXY && PROXY.online)) {
+    box.innerHTML = '<div class="note">代理离线，无法读取设备列表。</div>';
+    return;
+  }
+  if (!DEVICES.length) {
+    box.innerHTML = '<div class="note">还没有签发过设备。点「生成设备密钥」直接发放，或生成配对码让手机兑换。</div>';
+    return;
+  }
+  for (const d of DEVICES) {
+    const row = document.createElement('div');
+    row.className = 'dev';
+
+    const head = document.createElement('div');
+    head.className = 'row1';
+    const name = document.createElement('b');
+    name.textContent = d.name || '(未命名)';
+    const prefix = document.createElement('code');
+    prefix.textContent = d.prefix || '';
+    head.appendChild(name);
+    head.appendChild(prefix);
+    if (d.revokedAt != null) {
+      const tag = document.createElement('span');
+      tag.className = 'tag revoked';
+      tag.textContent = '已吊销';
+      head.appendChild(tag);
+    }
+    row.appendChild(head);
+
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = `创建 ${deviceTime(d.createdAt)} · 最近使用 ${deviceTime(d.lastUsedAt)}`;
+    row.appendChild(meta);
+
+    if (d.revokedAt == null) {
+      const btn = document.createElement('button');
+      btn.className = 'mini';
+      btn.textContent = '吊销';
+      btn.onclick = async () => {
+        btn.disabled = true;
+        const r = await window.shell.securityRevoke(d.id);
+        if (!r.ok) {
+          btn.disabled = false;
+          $('deviceHint').textContent = '吊销失败:' + (r.error || '未知错误');
+          return;
+        }
+        await refreshDevices();
+      };
+      row.appendChild(btn);
+    }
+    box.appendChild(row);
+  }
+}
+
+async function refreshDevices() {
+  if (!(PROXY && PROXY.online)) {
+    DEVICES = [];
+    renderDeviceList();
+    renderDeviceHint();
+    return;
+  }
+  const r = await window.shell.securityDevices();
+  if (!r.ok) {
+    DEVICES = [];
+    renderDeviceList();
+    $('deviceHint').textContent = '读取设备列表失败:' + (r.error || '未知错误');
+    return;
+  }
+  DEVICES = r.data && Array.isArray(r.data.devices) ? r.data.devices : [];
+  renderDeviceList();
+  renderDeviceHint();
 }
 
 // ------------------------------------------------------ 任务档位 / 压缩代理
@@ -1593,6 +1733,8 @@ async function loadProxyStatus() {
     renderProfiles();
     // 代理掉线后二维码要退回直连地址,所以这里也得重画
     renderLan();
+    renderDeviceList();
+    renderDeviceHint();
     return;
   }
   const d = r.data;
@@ -1612,6 +1754,8 @@ async function loadProxyStatus() {
   renderProfiles();
   // 代理上下线会改变二维码该指向哪里,所以状态一变就重画局域网面板
   renderLan();
+  // 设备管理依赖代理在线：每次状态刷新都同步按钮与列表。
+  await refreshDevices();
 }
 
 /** 按钮上短暂显示一句反馈,然后恢复原文案。 */
@@ -1732,6 +1876,62 @@ async function showLogs() {
   $('btnRefreshNet').onclick = async () => {
     await refreshNet();
     flash('btnRefreshNet', '已刷新');
+  };
+
+  // ---- 设备访问（局域网 / P1）----
+  // 开关是代理的启动期环境变量；主进程在代理托管中会自动重启代理。
+  $('optDeviceAuth').onchange = async (e) => {
+    const want = e.target.checked;
+    const r = await window.shell.setSettings({ deviceAuth: want });
+    SETTINGS.deviceAuth = !!(r && r.deviceAuth);
+    e.target.checked = SETTINGS.deviceAuth;
+    if (r && r.proxyRestarted) $('barText').textContent = '设备鉴权已切换 · 代理已重启';
+    renderDeviceHint();
+    await loadProxyStatus();
+    await refreshDevices();
+  };
+
+  // 直接签发：key 只显示这一次。不写 localStorage、不 console.log、不进日志。
+  $('btnIssueDevice').onclick = async () => {
+    const r = await window.shell.securityIssue('手动签发设备');
+    if (!r.ok) {
+      $('deviceHint').textContent = '签发失败:' + (r.error || '未知错误');
+      return;
+    }
+    const d = r.data || {};
+    const box = $('deviceOnceBox');
+    box.innerHTML = '';
+    const title = document.createElement('b');
+    title.textContent = '设备密钥（只显示一次）';
+    const line = document.createElement('div');
+    line.textContent = `设备:${d.name || ''}（${d.deviceId || ''}）`;
+    const tip = document.createElement('div');
+    tip.textContent = '把这串密钥粘贴到手机的 API Key 输入框；离开本页后无法再次查看。';
+    const key = document.createElement('code');
+    key.textContent = d.key || '';
+    box.append(title, line, tip, key);
+    box.classList.remove('hidden');
+    await refreshDevices();
+  };
+
+  // 配对码：给手机用 /_pair 兑换。code 同样只显示这一次。
+  $('btnPairing').onclick = async () => {
+    const r = await window.shell.securityPairing();
+    if (!r.ok) {
+      $('deviceHint').textContent = '生成配对码失败:' + (r.error || '未知错误');
+      return;
+    }
+    const d = r.data || {};
+    const box = $('pairingBox');
+    box.innerHTML = '';
+    const title = document.createElement('b');
+    title.textContent = '配对码（只显示一次）';
+    const code = document.createElement('code');
+    code.textContent = d.code || '';
+    const exp = document.createElement('div');
+    exp.textContent = `有效期至 ${new Date(d.expiresAt).toLocaleTimeString()}（通过代理的 /_pair 兑换，成功后会得到设备密钥）`;
+    box.append(title, code, exp);
+    box.classList.remove('hidden');
   };
 
   // ---- 自动上下文压缩开关 ----

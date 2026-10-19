@@ -1243,24 +1243,50 @@ ipcMain.handle('settings:get', () => {
     // P3：关窗是否保留服务（默认 true）。设置页已有复选框；主进程每次
     // close 都现读设置，所以改完立即生效，不需要重启外壳。
     keepServerOnClose: s.keepServerOnClose !== false,
+    // P1：局域网客户端是否必须配对/携带设备密钥（默认 false = 现有行为）。
+    deviceAuth: s.deviceAuth === true,
     addresses: localAddresses(serviceStatus().port || configuredBasePort()),
   };
 });
 
-ipcMain.handle('settings:set', (_e, patch) => {
+ipcMain.handle('settings:set', async (_e, patch) => {
+  const before = settings.readSettings();
   const clean = {};
   if (typeof patch?.apiKey === 'string') clean.apiKey = patch.apiKey.trim();
   if (typeof patch?.lanMode === 'boolean') clean.lanMode = patch.lanMode;
   if (typeof patch?.probe === 'boolean') clean.probe = patch.probe;
   if (typeof patch?.keepServerOnClose === 'boolean') clean.keepServerOnClose = patch.keepServerOnClose;
+  if (typeof patch?.deviceAuth === 'boolean') clean.deviceAuth = patch.deviceAuth;
   settings.writeSettings(clean);
   const s = settings.readSettings();
+
+  // 设备鉴权是代理的启动期环境变量：开关变化且代理正由外壳托管时重启它，
+  // 让 PROXY_DEVICE_AUTH 生效。外部代理无法替用户重启，只记日志说明。
+  let proxyRestarted = false;
+  const deviceAuthChanged = typeof clean.deviceAuth === 'boolean'
+    && (before.deviceAuth === true) !== (s.deviceAuth === true);
+  if (deviceAuthChanged && proxyChild) {
+    appendShellLog(`[shell] 设备鉴权已${s.deviceAuth === true ? '开启' : '关闭'}，重启代理使配置生效`);
+    try {
+      const r = await startProxy({ refresh: true });
+      proxyRestarted = !!(r && r.ok && !r.already);
+    } catch (e) {
+      appendShellLog(`[shell] 设备鉴权变更后重启代理失败: ${e.message}`);
+    }
+  } else if (deviceAuthChanged) {
+    appendShellLog(proxyState.external
+      ? `[shell] 设备鉴权已${s.deviceAuth === true ? '开启' : '关闭'}（代理由外部启动，需手动重启才生效）`
+      : `[shell] 设备鉴权已${s.deviceAuth === true ? '开启' : '关闭'}（代理未运行，下次启动生效）`);
+  }
+
   return {
     ok: true,
     apiKey: s.apiKey || '',
     lanMode: !!s.lanMode,
     probe: s.probe !== false,
     keepServerOnClose: s.keepServerOnClose !== false,
+    deviceAuth: s.deviceAuth === true,
+    ...(proxyRestarted ? { proxyRestarted: true } : {}),
   };
 });
 
@@ -1293,7 +1319,8 @@ ipcMain.handle('status', async () => {
   // 拼一个 8091 之类的地址去请求 —— 那会把"端口上碰巧有别的东西"
   // 误报成"我们的服务在跑"。
   const base = st.url || null;
-  const apiKey = (settings.readSettings().apiKey || '').trim();
+  const currentSettings = settings.readSettings();
+  const apiKey = (currentSettings.apiKey || '').trim();
   const health = base ? await httpGet(`${base}health`, 1500, apiKey) : { ok: false };
   const slots = base ? await httpGet(`${base}slots`, 1500, apiKey) : { ok: false };
   let ctx = null;
@@ -1334,6 +1361,8 @@ ipcMain.handle('status', async () => {
     url: health.ok ? base : null,
     // 可选徽章信息（version/build/flags 数）。既有字段不变。
     caps: capsSummary(lastCaps),
+    // P1：局域网设备鉴权当前是否开启（只读状态，设置入口在 settings:set）。
+    deviceAuth: currentSettings.deviceAuth === true,
     // P2：当前模型的安全摘要（可选；没有模型时为 null）。
     meta: model ? model.meta : null,
   };
@@ -1391,6 +1420,8 @@ ipcMain.handle('proxy:status', async () => {
     // 当前代理指向哪个 llama 端口、是否允许局域网访问
     target: proxyState.target,
     allowLan: proxyState.allowLan,
+    // P1：当前代理进程启动时用的设备鉴权开关（设置可能已先于代理更新）。
+    deviceAuth: proxyRuntime.deviceAuth,
     node: proxyNodeExe || findNodeExe(),
   };
   return { ...r, port: PROXY_PORT, lifecycle };
@@ -1423,6 +1454,62 @@ ipcMain.handle('proxy:setCompression', async (_e, enabled) => {
   return r.ok ? { ok: true, ...r.data } : { ok: false, error: r.data?.error || r.raw || `HTTP ${r.status}` };
 });
 
+// ------------------------------------------------- P1 设备管理（本地 IPC → 代理）
+
+/**
+ * 把设备管理请求收敛成界面能直接消费的形状：{ ok, data?, error? }。
+ *
+ * 设备管理端点只暴露在代理的 /_security/* 上（复用 /_bridge token），
+ * 渲染层不直接发 HTTP —— 一是拿不到 token，二是代理可能没启动。
+ * 所以这里统一翻译两类失败：代理离线 / 代理返回非 2xx，都不向渲染层抛异常。
+ */
+async function securityRequest(method, path, body) {
+  const r = await proxyRequest(method, path, body);
+  if (r.offline) {
+    return { ok: false, offline: true, error: '代理未在运行，请先在「任务档位」里启动代理' };
+  }
+  if (!r.ok) {
+    const error = r.data && typeof r.data.error === 'string'
+      ? r.data.error
+      : (r.raw || `HTTP ${r.status}`);
+    return { ok: false, error, status: r.status };
+  }
+  return { ok: true, data: r.data };
+}
+
+/** 本机直接签发设备密钥（key 只返回这一次；渲染层只能显示，不能持久化）。 */
+function securityIssue(name) {
+  return securityRequest('POST', '/_security/issue', {
+    name: typeof name === 'string' ? name : '',
+  });
+}
+
+/** 生成一次性配对码，供手机在 /_pair 兑换。 */
+function securityPairing() {
+  return securityRequest('POST', '/_security/pairing', {});
+}
+
+/** 设备列表（不含明文 key/hash）。 */
+function securityDevices() {
+  return securityRequest('GET', '/_security/devices');
+}
+
+/** 吊销设备；之后该设备的 key 立即失效。 */
+function securityRevoke(id) {
+  return securityRequest('POST', '/_security/revoke', { id });
+}
+
+/** 轮换设备密钥；旧 key 立即失效，新 key 只返回这一次。 */
+function securityRotate(id) {
+  return securityRequest('POST', '/_security/rotate', { id });
+}
+
+ipcMain.handle('security:issue', (_e, payload) => securityIssue(payload && payload.name));
+ipcMain.handle('security:pairing', () => securityPairing());
+ipcMain.handle('security:devices', () => securityDevices());
+ipcMain.handle('security:revoke', (_e, payload) => securityRevoke(payload && payload.id));
+ipcMain.handle('security:rotate', (_e, payload) => securityRotate(payload && payload.id));
+
 // ------------------------------------------------- 代理进程的托管(起停/重启/放行)
 
 /**
@@ -1453,9 +1540,9 @@ let proxyNodeExe = null;
 //   - 它防的是"局域网里别的页面/进程直接调 _bridge"，不是长期凭据。
 // 只有在本进程第一次拉起代理时才生成（要求里的"每次拉起代理时生成"）。
 let proxyToken = null;
-// 当前被管代理的启动参数快照。用于在 llama 动态端口变化 / LAN 开关变化时
-// 判断要不要重启代理 —— 代理的监听地址与目标都是启动期环境变量。
-const proxyRuntime = { target: null, allowLan: false };
+// 当前被管代理的启动参数快照。用于在 llama 动态端口变化 / LAN 开关变化 /
+// 设备鉴权开关变化时判断要不要重启代理 —— 它们都是启动期环境变量。
+const proxyRuntime = { target: null, allowLan: false, deviceAuth: false };
 // 正在进行中的启动。见 startProxy 开头的说明:没有它,两处并发调用会各起一个。
 let proxyStartInFlight = null;
 const proxyState = {
@@ -1471,6 +1558,7 @@ const proxyState = {
   // 当前代理的绑定与目标（给界面/日志看，也方便测试断言）
   target: null,
   allowLan: false,
+  deviceAuth: false,
 };
 
 /** 生成本次会话的 /_bridge token（32 位十六进制）。 */
@@ -1495,6 +1583,11 @@ function desiredProxyTarget() {
 function desiredProxyAllowLan() {
   const s = settings.readSettings();
   return !!(s.lanMode && String(s.apiKey || '').trim());
+}
+
+/** P1：局域网客户端是否必须带设备密钥（默认 false = 不改变现有行为）。 */
+function desiredProxyDeviceAuth() {
+  return settings.readSettings().deviceAuth === true;
 }
 
 function proxyLedgerPath() {
@@ -1736,8 +1829,11 @@ function startProxy(options = {}) {
   if (proxyChild) {
     const target = desiredProxyTarget();
     const allowLan = desiredProxyAllowLan();
-    const changed = proxyRuntime.target !== target || proxyRuntime.allowLan !== allowLan;
-    // 目标端口或监听范围变了才重启；否则幂等返回。
+    const deviceAuth = desiredProxyDeviceAuth();
+    const changed = proxyRuntime.target !== target
+      || proxyRuntime.allowLan !== allowLan
+      || proxyRuntime.deviceAuth !== deviceAuth;
+    // 目标端口、监听范围或设备鉴权开关变了才重启；否则幂等返回。
     if (!refresh || !changed) return Promise.resolve({ ok: true, already: true, managed: true });
   }
   if (proxyStartInFlight) return proxyStartInFlight;
@@ -1781,6 +1877,7 @@ function startProxy(options = {}) {
 
     const target = desiredProxyTarget();
     const allowLan = desiredProxyAllowLan();
+    const deviceAuth = desiredProxyDeviceAuth();
     const token = ensureProxyToken();
     const apiKey = (settings.readSettings().apiKey || '').trim();
 
@@ -1813,6 +1910,9 @@ function startProxy(options = {}) {
           // 显式传入的 PROXY_STATE_DIR 优先（tools/test_proxy_managed.mjs 用它
           // 做状态隔离，绝不能把测试配置写进生产目录）。
           PROXY_STATE_DIR: process.env.PROXY_STATE_DIR || LOG_DIR,
+          // 设备鉴权默认关闭。关闭时**不传**这个变量（代理按未设置处理），
+          // 保证 deviceAuth=false 时启动环境与接线前逐字节一致。
+          ...(deviceAuth ? { PROXY_DEVICE_AUTH: '1' } : {}),
         },
         stdio: ['ignore', fd, fd],
       });
@@ -1828,11 +1928,13 @@ function startProxy(options = {}) {
     proxyState.startedAt = Date.now();
     proxyState.target = target;
     proxyState.allowLan = allowLan;
+    proxyState.deviceAuth = deviceAuth;
     proxyRuntime.target = target;
     proxyRuntime.allowLan = allowLan;
+    proxyRuntime.deviceAuth = deviceAuth;
     if (p.pid) writeProxyLedger([p.pid]);
     try { p.unref(); } catch {}
-    appendShellLog(`[shell] 代理已启动: 目标 ${target},监听 ${allowLan ? '0.0.0.0' : '127.0.0.1'}:${PROXY_PORT}`);
+    appendShellLog(`[shell] 代理已启动: 目标 ${target},监听 ${allowLan ? '0.0.0.0' : '127.0.0.1'}:${PROXY_PORT},设备鉴权 ${deviceAuth ? '开' : '关'}`);
 
     p.on('error', (e) => {
       proxyState.lastError = `代理启动失败:${e.message}`;
@@ -1880,7 +1982,7 @@ function startProxy(options = {}) {
     const t0 = Date.now();
     for (;;) {
       const r = await proxyRequest('GET', '/_bridge/status');
-      if (r.ok) return { ok: true, started: true, node: nodeExe, target, allowLan };
+      if (r.ok) return { ok: true, started: true, node: nodeExe, target, allowLan, deviceAuth };
       if (exited) {
         const msg = `代理启动后立刻退出了(退出码 ${proxyState.lastExitCode})。日志末几行在 ${path.join(LOG_DIR, 'context-proxy.log')}。`;
         proxyState.lastError = msg;
@@ -2221,6 +2323,13 @@ module.exports.__test = {
   current: () => ({ ...current }),
   adoptExistingServer: (readyT0) => adoptExistingServer(readyT0),
   tryAdopt: (options) => ensureSupervisor().tryAdopt(options),
+  // P1：设备管理 handler（测试直接调用，不需要走 Electron IPC）。
+  securityIssue,
+  securityPairing,
+  securityDevices,
+  securityRevoke,
+  securityRotate,
+  securityRequest,
   // 热接管后的日志来源（文件是否存在/为什么不可读），供接线测试断言。
   logSource: () => logSourceInfo(),
   readLogTail: (maxLines) => readLogTail(maxLines),

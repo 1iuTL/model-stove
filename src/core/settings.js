@@ -25,6 +25,7 @@ const LEGACY_VERSION = 1;
 const ACCESS_MODES = Object.freeze(['local', 'lan', 'tunnel']);
 
 // 默认值。注意 keepServerOnClose 默认 true（关窗口不关服务）是已定决策。
+// deviceAuth 默认 false：局域网客户端不要求设备密钥，行为与 P1 接线前完全一致。
 const DEFAULT_SETTINGS = Object.freeze({
   version: SCHEMA_VERSION,
   apiKey: '',
@@ -34,11 +35,12 @@ const DEFAULT_SETTINGS = Object.freeze({
   lastModelId: null,
   lastPreset: null,
   accessMode: 'local',
+  deviceAuth: false,
 });
 
 const STRING_KEYS = Object.freeze(['apiKey', 'lastModelId', 'lastPreset']);
 const NULLABLE_STRING_KEYS = Object.freeze(['lastModelId', 'lastPreset']);
-const BOOLEAN_KEYS = Object.freeze(['probe', 'lanMode', 'keepServerOnClose']);
+const BOOLEAN_KEYS = Object.freeze(['probe', 'lanMode', 'keepServerOnClose', 'deviceAuth']);
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
