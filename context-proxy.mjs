@@ -35,6 +35,7 @@
 //   POST /_security/pairing  生成一次性 6 位配对码（手机随后用 /_pair 兑换）
 //   POST /_security/issue    本机直接签发设备密钥（不经配对；key 只返回一次）
 //   GET  /_security/devices  列出设备（不含明文 key/hash）
+//   GET  /_security/audit    查看最近的安全审计条目（?limit=，只读）
 //   POST /_security/revoke   吊销设备
 //   POST /_security/rotate   轮换设备密钥（新 key 只返回一次）
 import http from 'node:http'
@@ -716,6 +717,24 @@ function normalizeDeviceName(value) {
   return [...(text || '手动签发设备')].slice(0, 64).join('')
 }
 
+/**
+ * GET /_security/audit?limit= 的 limit 解析。
+ *
+ * 默认 100，范围 1..500；缺省、非整数、越界都回退默认值，不回报错 ——
+ * 这是只读诊断端点，参数写坏时给一份默认结果比 400 更有用。
+ */
+function parseAuditLimit(rawUrl) {
+  let value = null
+  try {
+    value = new URL(String(rawUrl || ''), 'http://127.0.0.1').searchParams.get('limit')
+  } catch {
+    value = null
+  }
+  const limit = Number(value)
+  if (!Number.isInteger(limit) || limit < 1 || limit > 500) return 100
+  return limit
+}
+
 /** /_security/*：管理端点，必须通过 /_bridge 的 token 规则。 */
 async function handleSecurityRequest(req, res, urlPath) {
   if (!bridgeAuthorized(req)) {
@@ -738,6 +757,26 @@ async function handleSecurityRequest(req, res, urlPath) {
       return
     }
     sendSecurityJson(res, 200, { ok: true, devices })
+    return
+  }
+
+  if (urlPath === '/_security/audit') {
+    if (req.method !== 'GET') {
+      sendSecurityJson(res, 405, { ok: false, error: 'method_not_allowed' })
+      return
+    }
+    const limit = parseAuditLimit(req.url)
+    let entries
+    try {
+      entries = auditLog.read({ limit })
+    } catch (e) {
+      log(`读取审计日志失败: ${e.message}`)
+      sendSecurityJson(res, 500, { ok: false, error: 'internal' })
+      return
+    }
+    // audit.read 只回放已经清洗过的字段（ts/event/deviceId?/ip?/detail?），
+    // 请求体、明文设备 key、上游 key 从不落审计，这里也不做二次拼装。
+    sendSecurityJson(res, 200, { ok: true, entries, file: AUDIT_FILE })
     return
   }
 

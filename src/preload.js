@@ -52,6 +52,8 @@ contextBridge.exposeInMainWorld('shell', {
   securityPairing: () => ipcRenderer.invoke('security:pairing'),
   /** 列出已签发设备（不含明文 key/hash）。 */
   securityDevices: () => ipcRenderer.invoke('security:devices'),
+  /** 查看最近的安全审计条目（只读；limit 默认 100，最大 500）。 */
+  securityAudit: (limit) => ipcRenderer.invoke('security:audit', { limit }),
   /** 吊销设备；之后该设备的 key 立即失效。 */
   securityRevoke: (id) => ipcRenderer.invoke('security:revoke', { id }),
   /** 轮换设备密钥；旧 key 立即失效，新 key 只返回这一次。 */

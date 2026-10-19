@@ -1494,6 +1494,13 @@ function securityDevices() {
   return securityRequest('GET', '/_security/devices');
 }
 
+/** 最近的安全审计条目。只读诊断数据，不含请求体/明文密钥。 */
+function securityAudit(limit) {
+  const raw = Number(limit);
+  const n = Number.isInteger(raw) && raw >= 1 && raw <= 500 ? raw : 100;
+  return securityRequest('GET', `/_security/audit?limit=${n}`);
+}
+
 /** 吊销设备；之后该设备的 key 立即失效。 */
 function securityRevoke(id) {
   return securityRequest('POST', '/_security/revoke', { id });
@@ -1507,6 +1514,7 @@ function securityRotate(id) {
 ipcMain.handle('security:issue', (_e, payload) => securityIssue(payload && payload.name));
 ipcMain.handle('security:pairing', () => securityPairing());
 ipcMain.handle('security:devices', () => securityDevices());
+ipcMain.handle('security:audit', (_e, payload) => securityAudit(payload && payload.limit));
 ipcMain.handle('security:revoke', (_e, payload) => securityRevoke(payload && payload.id));
 ipcMain.handle('security:rotate', (_e, payload) => securityRotate(payload && payload.id));
 
@@ -2327,6 +2335,7 @@ module.exports.__test = {
   securityIssue,
   securityPairing,
   securityDevices,
+  securityAudit,
   securityRevoke,
   securityRotate,
   securityRequest,

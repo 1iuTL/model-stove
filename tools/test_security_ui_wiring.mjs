@@ -4,10 +4,10 @@
 // 各自独立的字符串契约，任何一层改名/漏加都不会有编译错误，只会在用户点按钮
 // 时才炸。这里用最轻的方式把它们钉在一起：
 //   1. 用 electron 桩 require src/main.js，抓 ipcMain.handle 注册的通道；
-//   2. 读 preload 文本，确认 5 个 security 方法真的 invoke 了对应通道；
+//   2. 读 preload 文本，确认 6 个 security 方法真的 invoke 了对应通道；
 //   3. 读 index.html，确认新 id 存在且内联脚本用 $('id') 引用了它们；
 //   4. 读 core/settings 的默认值，确认 deviceAuth=false（不改变现有行为）；
-//   5. 静态确认代理新增了 /_security/issue，且集成测试覆盖了它。
+//   5. 静态确认代理新增了 /_security/issue 与 /_security/audit，且集成测试覆盖。
 //
 // 用法：node tools/test_security_ui_wiring.mjs
 import fs from 'node:fs';
@@ -75,6 +75,7 @@ try {
     'security:issue',
     'security:pairing',
     'security:devices',
+    'security:audit',
     'security:revoke',
     'security:rotate',
     'settings:get',
@@ -87,7 +88,7 @@ try {
   check('IPC 通道没有重复', dupes.length === 0, dupes.join(','));
 
   const t = main.__test || {};
-  for (const name of ['securityIssue', 'securityPairing', 'securityDevices', 'securityRevoke', 'securityRotate']) {
+  for (const name of ['securityIssue', 'securityPairing', 'securityDevices', 'securityAudit', 'securityRevoke', 'securityRotate']) {
     check(`__test.${name} 是函数`, typeof t[name] === 'function');
   }
 
@@ -108,6 +109,7 @@ try {
     ['securityIssue', 'security:issue'],
     ['securityPairing', 'security:pairing'],
     ['securityDevices', 'security:devices'],
+    ['securityAudit', 'security:audit'],
     ['securityRevoke', 'security:revoke'],
     ['securityRotate', 'security:rotate'],
   ];
@@ -122,7 +124,7 @@ try {
   const html = read('src/index.html');
   const newIds = [
     'optDeviceAuth', 'btnIssueDevice', 'deviceOnceBox',
-    'btnPairing', 'pairingBox', 'deviceList', 'deviceHint',
+    'btnPairing', 'pairingBox', 'deviceList', 'btnAudit', 'auditBox', 'deviceHint',
   ];
   for (const id of newIds) {
     check(`index.html 存在 #${id}`, html.includes(`id="${id}"`));
@@ -135,9 +137,11 @@ try {
   const allIds = [...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]);
   const idDupes = [...new Set(allIds.filter((v, i) => allIds.indexOf(v) !== i))];
   check('新 id 没有与既有 id 重复', idDupes.length === 0, idDupes.join(','));
-  for (const call of ['securityIssue', 'securityPairing', 'securityDevices', 'securityRevoke']) {
+  for (const call of ['securityIssue', 'securityPairing', 'securityDevices', 'securityAudit', 'securityRevoke']) {
     check(`设置页调用了 window.shell.${call}`, inline.includes(`window.shell.${call}(`));
   }
+  check('审计结果用 textContent 渲染（不拼 innerHTML）',
+    /window\.shell\.securityAudit\([\s\S]{0,1200}\.textContent\s*=/.test(inline));
   check('签发结果区提示只显示一次', /只显示一次/.test(html));
   check('关闭设备鉴权仍是现有行为（文案）', /关闭 = 现有行为/.test(html));
 
@@ -150,10 +154,15 @@ try {
   // ------------------------------------------- 5. 代理端点 + 集成测试静态覆盖
   const proxy = read('context-proxy.mjs');
   check('代理包含 /_security/issue', proxy.includes("'/_security/issue'"));
+  check('代理包含 /_security/audit', proxy.includes("'/_security/audit'"));
+  check('审计端点仍先过 bridgeAuthorized', /handleSecurityRequest[\s\S]{0,200}bridgeAuthorized\(req\)/.test(proxy));
+  check('审计端点通过 auditLog.read({ limit }) 读取', /auditLog\.read\(\{\s*limit\s*\}\)/.test(proxy));
+  check('审计端点返回 file 路径', /file:\s*AUDIT_FILE/.test(proxy));
   check('签发端点仍先过 bridgeAuthorized', /handleSecurityRequest[\s\S]{0,200}bridgeAuthorized\(req\)/.test(proxy));
   check('签发调用 registry.issueDevice', /issueDevice\(\{\s*name\s*\}\)/.test(proxy));
   const wiringTest = read('tools/test_security_wiring.mjs');
   check('集成测试覆盖 /_security/issue', wiringTest.includes("'/_security/issue'"));
+  check('集成测试覆盖 /_security/audit', wiringTest.includes("'/_security/audit"));
   check('集成测试断言 issue 审计', wiringTest.includes("'issue'"));
 } catch (e) {
   check('测试执行无异常', false, e && e.message ? e.message : String(e));

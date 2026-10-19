@@ -6,6 +6,7 @@
 // 覆盖（对应任务里的 1-8 项）：
 //   1. /_security/pairing 需要 bridge token；200 返回 6 位 code；审计 pair_create
 //   1b. /_security/issue 需要 bridge token；key 可用、只出现一次、设备名截断
+//   1c. GET /_security/audit：bridge token、entries 数组、limit 回退、no-store
 //   2. /_pair 公开兑换（单次）；成功/失败都写审计，失败响应统一 401
 //   3. /v1 设备鉴权：无 key 401、x-device-key/Bearer 200、错误 key 401；
 //      上游只看到 UPSTREAM_KEY，看不到设备 key
@@ -484,6 +485,67 @@ try {
   check('审计还包含预期事件',
     ['pair_create', 'pair_redeem_ok', 'pair_redeem_fail', 'auth_ok', 'auth_fail', 'revoke']
       .every((name) => auditEvents(a.stateDir).includes(name)));
+
+  // ---- 1c. 审计查看端点（GET /_security/audit，只读）----
+  console.log('\n--- A1c. 审计查看端点 ---');
+  const auditNoToken = await request({ port: portA, path: '/_security/audit' });
+  check('GET /_security/audit 无 bridge token → 401',
+    auditNoToken.status === 401 && jsonOf(auditNoToken)?.error === 'unauthorized',
+    `HTTP ${auditNoToken.status}`);
+  check('审计 401 同样 no-store', auditNoToken.headers['cache-control'] === 'no-store',
+    String(auditNoToken.headers['cache-control']));
+
+  const auditView = await request({
+    port: portA, path: '/_security/audit?limit=100', headers: bridgeHeaders,
+  });
+  const auditBody = jsonOf(auditView);
+  const viewEntries = Array.isArray(auditBody?.entries) ? auditBody.entries : [];
+  check('带 token 查看审计 → 200 且 entries 是数组',
+    auditView.status === 200 && auditBody?.ok === true && Array.isArray(auditBody.entries),
+    `HTTP ${auditView.status}`);
+  check('审计响应 no-store', auditView.headers['cache-control'] === 'no-store',
+    String(auditView.headers['cache-control']));
+  check('审计响应带 file 路径',
+    typeof auditBody?.file === 'string'
+    && path.resolve(auditBody.file) === path.join(a.stateDir, 'audit.jsonl'),
+    auditBody ? String(auditBody.file) : '');
+  check('审计条目包含此前测试产生的事件',
+    ['pair_create', 'pair_redeem_ok', 'issue', 'auth_ok'].every(
+      (name) => viewEntries.some((entry) => entry.event === name),
+    ));
+  const lastAuditEntry = readAudit(a.stateDir).at(-1);
+  check('审计条目按时间从旧到新（最后一条与文件一致）',
+    !!lastAuditEntry && viewEntries.at(-1)?.event === lastAuditEntry.event,
+    String(viewEntries.at(-1)?.event || ''));
+
+  const auditLimited = await request({
+    port: portA, path: '/_security/audit?limit=2', headers: bridgeHeaders,
+  });
+  const limitedEntries = jsonOf(auditLimited)?.entries;
+  check('limit=2 只返回 2 条',
+    auditLimited.status === 200 && Array.isArray(limitedEntries) && limitedEntries.length === 2,
+    Array.isArray(limitedEntries) ? String(limitedEntries.length) : auditLimited.body.slice(0, 80));
+
+  for (const badLimit of ['0', 'abc', '501', '-3']) {
+    const fallback = await request({
+      port: portA, path: `/_security/audit?limit=${badLimit}`, headers: bridgeHeaders,
+    });
+    const entries = jsonOf(fallback)?.entries;
+    check(`非法 limit=${badLimit} 回退默认 100`,
+      fallback.status === 200 && Array.isArray(entries) && entries.length > 2,
+      Array.isArray(entries) ? `返回 ${entries.length} 条` : `HTTP ${fallback.status}`);
+  }
+
+  check('审计响应不含设备 key / 上游 key',
+    !auditView.body.includes(key1) && !auditView.body.includes(issuedKey)
+    && !auditView.body.includes(UPSTREAM_KEY) && !auditView.body.includes(rotateBody.key));
+
+  const auditPost = await postJson({
+    port: portA, path: '/_security/audit', headers: bridgeHeaders, body: {},
+  });
+  check('POST /_security/audit → 405',
+    auditPost.status === 405 && jsonOf(auditPost)?.error === 'method_not_allowed',
+    `HTTP ${auditPost.status}`);
 
   await stopChild(a.child);
 

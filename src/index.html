@@ -127,6 +127,13 @@
     word-break: break-all; user-select: all;
   }
   #pairingBox code { font-size: 15px; letter-spacing: 2px; }
+  #auditBox.hidden { display: none; }
+  #auditBox {
+    max-height: 220px; overflow: auto; margin-top: 6px; padding: 6px 8px;
+    border: 1px solid var(--line); border-radius: 6px; background: #10131a;
+    color: #c9d1d9; font: 10.5px/1.55 Consolas, "Cascadia Mono", monospace;
+    white-space: pre-wrap; word-break: break-all;
+  }
   #deviceList .dev {
     background: #10131a; border: 1px solid var(--line); border-radius: 6px;
     padding: 6px 8px; margin-top: 5px; font-size: 11px; line-height: 1.5;
@@ -395,11 +402,13 @@
         <div class="btnrow">
           <button id="btnIssueDevice" class="mini">生成设备密钥</button>
           <button id="btnPairing" class="mini">生成配对码</button>
+          <button id="btnAudit" class="mini">查看安全日志</button>
         </div>
         <div id="deviceHint" class="note"></div>
         <div id="deviceOnceBox" class="warn hidden"></div>
         <div id="pairingBox" class="warn hidden"></div>
         <div id="deviceList"></div>
+        <pre id="auditBox" class="hidden"></pre>
       </div>
 
       <div class="sec">
@@ -1931,6 +1940,34 @@ async function showLogs() {
     const exp = document.createElement('div');
     exp.textContent = `有效期至 ${new Date(d.expiresAt).toLocaleTimeString()}（通过代理的 /_pair 兑换，成功后会得到设备密钥）`;
     box.append(title, code, exp);
+    box.classList.remove('hidden');
+  };
+
+  // 安全日志：只读展示最近 100 条审计条目。全部用 textContent 拼纯文本，
+  // 设备名/detail 都来自外部输入，绝不能拼 innerHTML。再点一次收起。
+  $('btnAudit').onclick = async () => {
+    const box = $('auditBox');
+    if (!box.classList.contains('hidden')) {
+      box.classList.add('hidden');
+      box.textContent = '';
+      return;
+    }
+    const r = await window.shell.securityAudit(100);
+    if (!r.ok) {
+      $('deviceHint').textContent =
+        (r.offline ? '代理未在运行：' : '读取安全日志失败:') + (r.error || '未知错误');
+      return;
+    }
+    const d = r.data || {};
+    const entries = Array.isArray(d.entries) ? d.entries : [];
+    if (!entries.length) {
+      $('deviceHint').textContent = '安全日志还是空的：还没有设备鉴权、配对或限流记录。';
+      return;
+    }
+    box.textContent = entries.map((e) => {
+      const ts = e && e.ts ? new Date(e.ts).toLocaleString() : '—';
+      return [ts, (e && e.event) || '—', (e && e.ip) || '—', (e && e.detail) || '—'].join(' | ');
+    }).join('\n');
     box.classList.remove('hidden');
   };
 
