@@ -1,56 +1,70 @@
 // model-stove —— 外壳自己的设置(跟模型清单分开)。
 //
-// 存哪些东西:用户不想每次都重输、又不适合写进源码的偏好。
-// 目前只有 API Key —— 手机访问时用它挡住同网段的其他人。
+// 这一层现在只是 src/core/settings.js 的**薄适配**：
+//   - 文件位置由 paths.settingsFile 决定（main.js 在 app ready 后注入）；
+//   - 读/写交给 core：版本化、非法值回落、旧文件迁移、坏文件备份、原子写；
+//   - 对外保留原来的四个导出，main.js 的调用点不需要跟着换一套 API。
 //
-// 放哪儿:Electron 的 userData 目录,而不是程序目录。
-// 原因有两个:一是程序目录在更新/重装时会被覆盖,二是用户目录天然是
-// 每个账户私有,不会跟着仓库被提交上去。
+// 为什么还要留这层而不是让 main.js 直接 require core：
+//   main.js 里全是 `settings.readSettings()` 这样的调用点，保留同名导出能把
+//   改动限制在一个文件里，也避免把"设置文件在哪"这种路径决策抄两遍。
 //
-// 文件权限说明:Windows 下没有 chmod 那一套,这个文件对同机其它账户
-// 可读。它保护的是「局域网里的别人」,不是「本机上的别人」—— 后者
-// 本来就等同有你这个账户的权限。这个边界要说清楚,不能给人假的安全感。
-const fs = require('fs');
+// 兼容性：旧版把设置写在 `<userData>/settings.json`。默认情况下 paths.dataDir
+// 就是 userData，所以 initSettings(userData) 与 initSettingsFile(paths.settingsFile)
+// 指向同一个文件 —— 旧 Key 会被 core 当作 v1 自动迁移成 v2，不需要用户重输。
 const path = require('path');
-const crypto = require('crypto');
+const core = require('./core/settings');
 
-let settingsPath = null;
+// 绝对路径。null 表示还没初始化 —— 这时读写都按"没有设置"处理。
+let settingsFile = null;
+// 迁移/校验警告只提示一次，避免每次状态轮询都往控制台刷同一句。
+let warned = false;
 
-/** 由 main.js 在 app ready 之后调用,传进真正的 userData 路径。 */
+/** 由 main.js 在 app ready 之后调用，传进真正的 userData 目录（旧版接口）。 */
 function initSettings(userDataDir) {
-  settingsPath = path.join(userDataDir, 'settings.json');
+  settingsFile = path.join(userDataDir, 'settings.json');
+  warned = false;
+  return settingsFile;
+}
+
+/** 直接指定设置文件的绝对路径（main.js 用 paths.settingsFile 调这个）。 */
+function initSettingsFile(file) {
+  settingsFile = String(file);
+  warned = false;
+  return settingsFile;
+}
+
+function currentFile() {
+  return settingsFile;
 }
 
 function readSettings() {
-  if (!settingsPath) return {};
-  try {
-    const raw = fs.readFileSync(settingsPath, 'utf8');
-    const obj = JSON.parse(raw);
-    return obj && typeof obj === 'object' ? obj : {};
-  } catch {
-    // 文件不存在,或者被手工改坏了。都当作「没设置过」,
-    // 这样用户删掉文件就能回到默认状态。
-    return {};
+  if (!settingsFile) return {};
+  const result = core.loadSettings(settingsFile);
+  if (!warned && result.warnings.length) {
+    warned = true;
+    // 坏文件会被 core 备份成 *.bad-<时间戳>，这里只把原因说出来。
+    console.warn('[settings] 设置文件有警告:', result.warnings.map((w) => w.reason).join(', '));
+    if (result.backupFile) console.warn('[settings] 坏文件已备份到:', result.backupFile);
   }
+  return result.settings;
 }
 
 function writeSettings(patch) {
-  if (!settingsPath) throw new Error('设置尚未初始化');
-  const next = { ...readSettings(), ...patch };
-  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
-  fs.writeFileSync(settingsPath, JSON.stringify(next, null, 2), 'utf8');
-  return next;
+  if (!settingsFile) throw new Error('设置尚未初始化');
+  // updateSettings 内部是"读 → 校验 → 原子写"，失败会抛错，保持旧接口语义。
+  return core.updateSettings(settingsFile, patch || {}).settings;
 }
 
-/**
- * 造一个够用的随机 Key。
- *
- * 用 32 位十六进制(128 bit)。它是给人手抄/粘贴的,不追求口令那样的
- * 记忆强度 —— 攻击面是同一个 WiFi 下的人,128 bit 足够。
- * 刻意只用 0-9a-f:避免大小写混淆、也避免 URL 里需要转义的字符。
- */
 function generateApiKey() {
-  return crypto.randomBytes(16).toString('hex');
+  return core.generateApiKey();
 }
 
-module.exports = { initSettings, readSettings, writeSettings, generateApiKey };
+module.exports = {
+  initSettings,
+  initSettingsFile,
+  currentFile,
+  readSettings,
+  writeSettings,
+  generateApiKey,
+};

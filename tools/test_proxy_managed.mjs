@@ -83,11 +83,13 @@ const t = m.__test;
   const r1 = await t.startProxy();
   log('start', r1);
 
-  // 代理起来了就应该能应答 /_bridge/status
+  // 代理起来了就应该能应答 /_bridge/status。
+  // 注意：外壳现在会生成 /_bridge 会话 token，测试用内部 proxyRequest
+  // （它自动带上 token），而不是直接 fetch。
   let status = null;
   try {
-    const res = await fetch('${BASE}/_bridge/status', { signal: AbortSignal.timeout(5000) });
-    status = { code: res.status, ok: res.ok, keys: Object.keys(await res.json()).sort() };
+    const sr = await t.proxyRequest('GET', '/_bridge/status');
+    status = { code: sr.status, ok: sr.ok, keys: Object.keys(sr.data || {}).sort() };
   } catch (e) { status = { error: e.message }; }
   log('status', status);
 
@@ -113,12 +115,7 @@ const t = m.__test;
   // 注意必须在 stopProxy 之前做 —— 代理停了就写不进去了(这行踩过)。
   let wrote = false;
   try {
-    const r = await fetch('${BASE}/_bridge/config', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ thresholdRatio: 0.75 }),
-      signal: AbortSignal.timeout(5000),
-    });
+    const r = await t.proxyRequest('POST', '/_bridge/config', { thresholdRatio: 0.75 });
     wrote = r.ok;
   } catch { /* 下面会报 */ }
   log('configWrite', { ok: wrote });
@@ -156,12 +153,12 @@ const t = m.__test;
     log('pidOnPort8091After', { pid: t.pidOnPort(8091) });
   }
 
-  // 停掉之后端口应该不再应答
+  // 停掉之后端口应该不再应答（proxyRequest 把连不上收敛成 offline）
   let after = null;
   try {
-    const res = await fetch('${BASE}/_bridge/status', { signal: AbortSignal.timeout(2500) });
-    after = { code: res.status };
-  } catch (e) { after = { unreachable: true, code: e.cause ? e.cause.code : e.message }; }
+    const r = await t.proxyRequest('GET', '/_bridge/status');
+    after = r.offline ? { unreachable: true, code: r.error } : { code: r.status };
+  } catch (e) { after = { unreachable: true, code: e.message }; }
   log('afterStop', after);
 
   process.stdout.write('@@RESULT@@' + JSON.stringify(out) + '@@END@@');
@@ -210,6 +207,8 @@ const p = spawn(process.execPath, [patchFile], {
   env: {
     ...process.env,
     MODEL_STOVE_NO_AUTO_PROXY: '1',
+    // 让 paths.logsDir 落在 repo/logs（下面的台账断言按这个路径写）。
+    MODEL_STOVE_HOME: REPO,
     PROXY_PORT: String(PORT),
     PROXY_STATE_DIR: TMP,
   },
@@ -285,15 +284,15 @@ const testState = path.join(TMP, 'context-proxy-state.json');
 const cfgWrite = step('configWrite');
 check('能写入代理配置', !!(cfgWrite && cfgWrite.ok), JSON.stringify(cfgWrite));
 check('测试的状态落在自己的目录', fs.existsSync(testState), testState);
-check('生产状态文件存在且是生产值', (() => {
+// 生产状态文件在干净的机器上可能本来就不存在（从没改过配置）。
+// 这里断言的是"测试没有把生产文件写成测试值"：不存在也算没污染。
+check('生产状态文件未被测试污染', (() => {
+  if (!fs.existsSync(prodState)) return true;
   try {
     const s = JSON.parse(fs.readFileSync(prodState, 'utf8'));
-    // 测试写的是 0.75;如果生产文件也是 0.75,无法区分"没被碰"和"被写成了 0.75"。
-    // 所以这里只断言它仍然是有效配置,真正确凿的证据是"临时文件存在" +
-    // "生产文件的修改时间没变"(下面这条)。
     return typeof s.thresholdRatio === 'number' && s.thresholdRatio >= 0.1;
   } catch { return false; }
-})(), '生产文件应可读且是合法配置');
+})(), prodState);
 
 console.log('\n--- 防火墙自检(不提权)---');
 const fw = step('firewall');
@@ -305,7 +304,12 @@ check('自检同时覆盖 node 与 app', !!(fw && fw.node && fw.app), fw ? Objec
 check('判据来自注册表', !!(fw && fw._source === 'registry'), fw ? `_source=${fw._source}` : '');
 // 这两条规则是实际加过的,注册表里查得到;查不到说明判据又坏了。
 check('node.exe 被识别为已放行', !!(fw && fw.node && fw.node.present), fw && fw.node ? `count=${fw.node.count}` : '');
-check('electron.exe 被识别为已放行', !!(fw && fw.app && fw.app.present), fw && fw.app ? `count=${fw.app.count}` : '');
+// electron 未安装时（本机当前就是）不存在 electron.exe，也就无从查规则；
+// 此时只要求"判据能给出结论"，不把环境缺失当成失败。
+const electronInstalled = !!(fw && fw.app && fs.existsSync(fw.app.program));
+check('electron.exe 规则自检可用' + (electronInstalled ? '' : '(未安装 electron,跳过存在性)'),
+  !!(fw && fw.app) && (!electronInstalled || fw.app.present),
+  fw && fw.app ? `count=${fw.app.count}` : '');
 
 console.log('\n--- 台账 ---');
 const ledgerRaw = (() => { try { return fs.readFileSync(LEDGER, 'utf8'); } catch { return '(无)'; } })();

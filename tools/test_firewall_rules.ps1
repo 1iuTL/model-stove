@@ -45,17 +45,42 @@ Check '结果里没有非 Allow 的' (($inAllow | Where-Object { $_.Action -ne '
 Check '结果里没有未启用的' (($inAllow | Where-Object { $_.Active -ne 'TRUE' }).Count -eq 0)
 
 # 关键回归:必须能按**程序路径**找到规则。这正是当初失败的用法。
+#
+# 这里用一组**合成规则**做判据断言，而不是依赖本机恰好存在 node.exe 的
+# 放行规则。原因很实际：新机器 / CI / 沙箱上 Node 规则经常根本不存在
+# （本机当前就是 0 条），而"判据是否正确"与"这台机器有没有加过规则"
+# 是两件事。真实机器的结果仍然打印出来，只作信息，不作断言。
 Write-Host ''
-Write-Host '=== 按程序路径判定(核心用途) ==='
+Write-Host '=== 按程序路径判定(核心用途,合成规则) ==='
 $nodeExe = 'C:\Program Files\nodejs\node.exe'
-$hits = Get-StoveInboundAllow -Needle $nodeExe
-Check 'node.exe 有入站允许规则' ($hits.Count -gt 0) "$($hits.Count) 条"
-$hits | Select-Object -First 3 | ForEach-Object { Write-Host "         $($_.Name)  Profile=$($_.Profile)" }
-
-Check 'Test-StoveProgramAllowed 对 node.exe 返回真' (Test-StoveProgramAllowed -Program $nodeExe)
-Check 'Test-StoveProgramAllowed 对不存在的程序返回假' (
-  -not (Test-StoveProgramAllowed -Program 'C:\definitely\not\a\real\program.exe')
+$fixture = @(
+  [pscustomobject]@{
+    Raw = 'v2.33|Action=Allow|Active=TRUE|Dir=In|App=C:\Program Files\nodejs\node.exe|Name=Synthetic Node In|'
+    Name = 'Synthetic Node In'; Dir = 'In'; Action = 'Allow'; Active = 'TRUE'
+    App = $nodeExe; Profile = 'Domain,Private,Public'
+  },
+  [pscustomobject]@{
+    Raw = 'v2.33|Action=Allow|Active=TRUE|Dir=Out|App=C:\Program Files\nodejs\node.exe|Name=Synthetic Node Out|'
+    Name = 'Synthetic Node Out'; Dir = 'Out'; Action = 'Allow'; Active = 'TRUE'
+    App = $nodeExe; Profile = 'Domain,Private,Public'
+  },
+  [pscustomobject]@{
+    Raw = 'v2.33|Action=Allow|Active=FALSE|Dir=In|App=C:\Program Files\nodejs\node.exe|Name=Synthetic Node Disabled|'
+    Name = 'Synthetic Node Disabled'; Dir = 'In'; Action = 'Allow'; Active = 'FALSE'
+    App = $nodeExe; Profile = 'Domain,Private,Public'
+  }
 )
+# ⚠️ @()：Windows PowerShell 5.1 中单个对象没有 .Count 属性。
+$fakeHits = @(Get-StoveInboundAllow -Needle $nodeExe -Rules $fixture)
+Check '按程序路径匹配且只保留入站+允许+启用' ($fakeHits.Count -eq 1) "$($fakeHits.Count) 条"
+Check 'Test-StoveProgramAllowed 对匹配的合成规则返回真' (Test-StoveProgramAllowed -Program $nodeExe -Rules $fixture)
+Check 'Test-StoveProgramAllowed 对不存在的程序返回假' (
+  -not (Test-StoveProgramAllowed -Program 'C:\definitely\not\a\real\program.exe' -Rules $fixture)
+)
+
+$hits = @(Get-StoveInboundAllow -Needle $nodeExe)
+Write-Host ("  本机 node.exe 的入站允许规则: {0} 条(仅为信息,不作断言)" -f $hits.Count)
+$hits | Select-Object -First 3 | ForEach-Object { Write-Host "         $($_.Name)  Profile=$($_.Profile)" }
 
 # netsh 的坑:它的显示名匹配在这台机器上不可靠。这里确认注册表路径不依赖它。
 Write-Host ''
@@ -66,7 +91,7 @@ Write-Host ("  netsh name=... 命中: {0}" -f $netshHas)
 $netshAll = netsh advfirewall firewall show rule name=all dir=in 2>&1
 $netshAllHas = ($netshAll | Select-String 'node\.exe').Count
 Write-Host ("  netsh name=all 里含 node.exe 的行: {0}" -f $netshAllHas)
-$regHas = (Get-StoveInboundAllow -Needle 'node.exe').Count
+$regHas = @(Get-StoveInboundAllow -Needle 'node.exe').Count
 Write-Host ("  注册表里 node.exe 的入站允许规则: {0} 条" -f $regHas)
 Write-Host '  -> 两者不一致时,以注册表为准(netsh 在这台机器上自相矛盾)'
 

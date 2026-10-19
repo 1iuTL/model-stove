@@ -27,8 +27,17 @@ function Get-StoveFirewallRuleValue {
   <#
     取回所有防火墙规则条目,解析成对象。
     返回项:{ Raw, Name, Dir, Action, Active, App, Profile }
+
+    -Rules 是测试注入点：传入一组已经解析好的对象时直接使用，不读注册表。
+    这样"过滤/按路径匹配"这套判据可以在任何机器上验证，而不依赖本机
+    恰好装没装某条防火墙规则（CI/新机器上 Node 规则经常不存在）。
   #>
-  param([string]$Needle = '')
+  param([string]$Needle = '', [object[]]$Rules = $null)
+
+  if ($null -ne $Rules) {
+    if (-not $Needle) { return $Rules }
+    return $Rules | Where-Object { ([string]$_.Raw) -match [regex]::Escape($Needle) }
+  }
 
   $props = Get-ItemProperty -Path $script:FwRulesKey -ErrorAction SilentlyContinue
   if (-not $props) { return @() }
@@ -71,9 +80,9 @@ function Get-StoveInboundAllow {
     实测踩过:用规则名当 Needle 做"清理复核",把**不该删的规则**也报成
     "已移除",并据此误删了两条正确的放行规则。用路径就没这个问题。
   #>
-  param([string]$Needle = '')
+  param([string]$Needle = '', [object[]]$Rules = $null)
 
-  Get-StoveFirewallRuleValue -Needle $Needle | Where-Object {
+  Get-StoveFirewallRuleValue -Needle $Needle -Rules $Rules | Where-Object {
     $_.Dir -eq 'In' -and $_.Action -eq 'Allow' -and $_.Active -eq 'TRUE'
   }
 }
@@ -83,8 +92,11 @@ function Test-StoveProgramAllowed {
     某个程序当前是否被入站放行。返回 $true/$false。
     界面上的"防火墙警告"就该用这个结论来决定要不要出现。
   #>
-  param([Parameter(Mandatory)][string]$Program)
+  param([Parameter(Mandatory)][string]$Program, [object[]]$Rules = $null)
 
-  $hits = Get-StoveInboundAllow -Needle $Program
+  # ⚠️ 必须用 @() 包起来：Windows PowerShell 5.1 里单个对象没有 .Count 属性，
+  # 直接写 `$hits.Count -gt 0` 在"只有一条规则"时会被当成 $null -gt 0 = false，
+  # 把"放行"误判成"没放行"。合成规则测试就是用来钉住这一点的。
+  $hits = @(Get-StoveInboundAllow -Needle $Program -Rules $Rules)
   return ($hits.Count -gt 0)
 }

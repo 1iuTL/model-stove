@@ -15,48 +15,155 @@ const os = require('os');
 const path = require('path');
 const http = require('http');
 const net = require('net');
+const crypto = require('crypto');
 
 const { MODELS, PRESETS, REASONING, REASONING_BUDGETS, DEFAULT_REASONING_BUDGET, buildArgs, PROXY_PORT, PROXY_BASE, CTX_STEPS, VRAM_CEILING_MIB, KV_TYPES, DEFAULT_KV, safeCtxFor, resolveKv } = require('./config');
 const { probeSpeed } = require('./probe');
 const settings = require('./settings');
-
-const PORT = 8091;
-const BASE = `http://127.0.0.1:${PORT}`;
+const { createPaths, ensureDirs } = require('./core/paths');
+const { Supervisor } = require('./core/supervisor');
+const ports = require('./core/ports');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const PROXY_SCRIPT = path.join(REPO_ROOT, 'context-proxy.mjs');
 
+// 默认起始端口。真正的端口由 Supervisor 从它开始扫描空闲值，不再写死。
+const DEFAULT_SERVER_PORT = 8091;
+
 let win = null;
-let child = null;
 // 未运行时的状态。收成一个常量,免得三处各写一份、改漏一处。
 const EMPTY_CURRENT = { modelId: null, preset: null, reasoning: null, budget: null, ctx: null, kv: null, speed: null, lanMode: false, startedAt: null };
 let current = { ...EMPTY_CURRENT };
-let logFile = null;
+
+// 路径与进程管理在 app ready 之后才确定（app.getPath 之前调不了）。
+// 模块顶层先留空，主要给 tools/test_shell_load.mjs 的"加载即成功"用；
+// 任何真正要起进程的入口都会先 ensureRuntime()。
+let paths = null;
+let supervisor = null;
+
+// 兼容旧模块级常量：在 ready 之前调用 runCapture/防火墙自检时仍有一个可写的日志目录。
+// ready 之后会被替换成 paths.logsDir。
+let LOG_DIR = path.join(REPO_ROOT, 'logs');
 
 // 子进程的输出写进文件,而不是管道。
 // Node 默认的管道 stdio 会打开匿名管道,某些沙箱会拒绝;而管道一旦失败,
-// 整个 Electron 主进程会被原生崩溃带走。重定向没有这两个问题,
-// 而且我们仍然可以读取这个文件来喂日志面板。
-const LOG_DIR = path.join(__dirname, '..', 'logs');
+// 整个 Electron 主进程会被原生崩溃带走。重定向没有这两个问题。
+// 现在这个职责收在 core/supervisor.js 里（logDir），这里只保留 shell 自己的日志。
 
 // ---------------------------------------------------------------- 工具函数
 
-/** 读取日志文件末尾若干行。 */
-function readLogTail(maxLines = 250) {
-  if (!logFile) return [];
-  try {
-    const text = fs.readFileSync(logFile, 'utf8');
-    const lines = text.split(/\r?\n/).filter((l) => l.trim());
-    return lines.slice(-maxLines);
-  } catch {
-    return [];
-  }
+// ------------------------------------------------------------ 路径 / 运行时
+
+/**
+ * 初始化路径、设置文件位置与 Supervisor。
+ *
+ * 必须等 app ready（app.getPath('userData') 之前不可靠）。重复调用是幂等的：
+ * 多个入口（whenReady / 测试 / 自测启动）都可能先撞上它。
+ */
+function initRuntime() {
+  if (paths) return paths;
+  const userDataDir = app.getPath('userData');
+  paths = createPaths({ installDir: REPO_ROOT, userDataDir });
+  ensureDirs(paths);
+  LOG_DIR = paths.logsDir;
+
+  // 设置文件：默认就是 paths.settingsFile（默认情况下 = userData/settings.json，
+  // 与旧版一致，core 会把旧文件当 v1 自动迁移）。
+  // MODEL_STOVE_SETTINGS_DIR 是旧测试开关，保留兼容；新代码请用 MODEL_STOVE_HOME。
+  const settingsOverride = String(process.env.MODEL_STOVE_SETTINGS_DIR || '').trim();
+  const settingsFile = settingsOverride
+    ? path.join(path.resolve(settingsOverride), 'settings.json')
+    : paths.settingsFile;
+  settings.initSettingsFile(settingsFile);
+
+  supervisor = createSupervisor();
+
+  appendShellLog(`[shell] 数据目录: ${paths.dataDir} (${paths.dataSource})`);
+  appendShellLog(`[shell] 日志目录: ${paths.logsDir}`);
+  const badSources = (paths.config.sources || []).filter((s) => s && s.file && s.loaded === false);
+  for (const s of badSources) appendShellLog(`[shell] 配置读不出来: ${s.file} (${s.error || '未知错误'})`);
+  return paths;
 }
 
+/** 配置里的起始端口；0/非法值回落到 8091（Supervisor 会从它开始找空闲端口）。 */
+function configuredBasePort() {
+  const raw = paths && paths.config && paths.config.values && paths.config.values.server
+    ? paths.config.values.server.port
+    : null;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 && n <= 65535 ? n : DEFAULT_SERVER_PORT;
+}
+
+/** 建 Supervisor，并把"崩溃只告警、不自动重启"的 P0 策略接上。 */
+function createSupervisor() {
+  const sup = new Supervisor({
+    logDir: (paths && paths.logsDir) || LOG_DIR,
+    ledgerFile: path.join((paths && paths.logsDir) || LOG_DIR, 'running-pids.json'),
+    basePort: configuredBasePort(),
+    scanRange: 64,
+  });
+
+  sup.on('state', () => notifyRenderer());
+
+  // 崩溃默认**不自动重启**：模型加载要几十秒，反复拉起只会让用户以为
+  // "软件卡住了"；先把状态和日志如实反映到界面，由用户决定。
+  sup.on('crash', (e) => {
+    const code = e && e.code != null ? ` code=${e.code}` : '';
+    const signal = e && e.signal ? ` signal=${e.signal}` : '';
+    appendShellLog(`[shell] 服务意外退出 pid=${e && e.pid}${code}${signal}`);
+    if (e && Array.isArray(e.tail) && e.tail.length) {
+      appendShellLog('[shell] 日志末尾:\n' + e.tail.slice(-12).join('\n'));
+    }
+    notifyRenderer();
+  });
+
+  return sup;
+}
+
+/** 拿到当前（或懒创建）Supervisor；只在 app ready 之后调用。 */
+function ensureSupervisor() {
+  if (!paths) initRuntime();
+  if (!supervisor) supervisor = createSupervisor();
+  return supervisor;
+}
+
+/** 当前服务状态的安全包装（未初始化时返回 idle）。 */
+function serviceStatus() {
+  if (!supervisor) {
+    return { state: 'idle', modelId: null, preset: null, pid: null, port: null, url: null, startedAt: null, uptimeMs: 0, generation: null, argvHash: null };
+  }
+  const st = supervisor.status();
+  // Supervisor 在空闲态会保留 lastPort（停止时要用它认领外部监听者）；
+  // 但界面的"端口"只在真的有被管服务时才该显示数字。
+  if (st.state !== 'ready' && st.state !== 'starting') return { ...st, port: null };
+  return st;
+}
+
+/** shell 自己的事件日志（不是 llama-server 的日志）。 */
+function appendShellLog(text) {
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    fs.appendFileSync(path.join(LOG_DIR, 'shell.log'),
+      `[${new Date().toISOString()}] ${String(text).replace(/\s+$/, '')}\n`, 'utf8');
+  } catch { /* 日志写不了不该阻断主流程 */ }
+  if (process.env.MODEL_STOVE_QUIET !== '1') console.log(text);
+}
+
+/** 读取当前被管服务日志的末尾（没有服务时为空数组）。 */
+function readLogTail(maxLines = 250) {
+  if (!supervisor) return [];
+  return supervisor.readLogTail(undefined, maxLines);
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 /** 发一个 GET,把结果收敛成 { ok, status, body } —— 连不上不抛异常。 */
-function httpGet(url, timeoutMs = 2500) {
+function httpGet(url, timeoutMs = 2500, apiKey = '') {
+  if (!url) return Promise.resolve({ ok: false, status: 0, body: '' });
   return new Promise((resolve) => {
-    const req = http.get(url, { timeout: timeoutMs }, (res) => {
+    const opts = { timeout: timeoutMs };
+    if (apiKey) opts.headers = { Authorization: `Bearer ${apiKey}` };
+    const req = http.get(url, opts, (res) => {
       let body = '';
       res.on('data', (d) => (body += d));
       res.on('end', () => resolve({ ok: res.statusCode === 200, status: res.statusCode, body }));
@@ -64,20 +171,6 @@ function httpGet(url, timeoutMs = 2500) {
     req.on('timeout', () => { req.destroy(); resolve({ ok: false, status: 0, body: '' }); });
     req.on('error', () => resolve({ ok: false, status: 0, body: '' }));
   });
-}
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-/** 轮询 /health 直到就绪。模型加载通常 30-60 秒,给足 5 分钟。 */
-async function waitForHealth(timeoutMs = 300000) {
-  const t0 = Date.now();
-  while (Date.now() - t0 < timeoutMs) {
-    if (!child) return false;
-    const r = await httpGet(`${BASE}/health`, 2000);
-    if (r.ok) return true;
-    await sleep(1200);
-  }
-  return false;
 }
 
 function modelExists(model) {
@@ -98,24 +191,25 @@ function binExists(model) {
 // 本来也要付这次 CUDA 图构建的钱,所以净成本是零。
 //
 // 用户可以在设置里关掉(settings.probe === false)。
-function runProbe(model) {
+function runProbe(model, baseUrl) {
   const s = settings.readSettings();
-  if (s.probe === false) return;
+  if (s.probe === false || !baseUrl) return;
+  const alive = () => {
+    const st = serviceStatus();
+    return st.state === 'ready' && !!st.url;
+  };
   current.speed = { pending: true };
   notifyRenderer();
   // apiKey:上游开了鉴权时探针也要带,否则 401 → 界面「实测速度 未取得」
-  probeSpeed(BASE, model, { alive: () => !!child, apiKey: (settings.readSettings().apiKey || '').trim() })
+  probeSpeed(baseUrl.replace(/\/+$/, ''), model, { alive, apiKey: (settings.readSettings().apiKey || '').trim() })
     .then((res) => {
-      if (!child) return;                       // 服务已经停了,别乱写状态
+      if (!alive()) return;                     // 服务已经停了,别乱写状态
       current.speed = res || { failed: true };
-      try {
-        fs.appendFileSync(logFile,
-          `[shell] 速度探针:${res ? res.tps + ' tok/s (基线 ' + res.expected +
-            (res.spilled ? ',判定溢出)' : ',正常)') : '未取得结果'}\n`);
-      } catch {}
+      appendShellLog(`[shell] 速度探针:${res ? res.tps + ' tok/s (基线 ' + res.expected +
+        (res.spilled ? ',判定溢出)' : ',正常)') : '未取得结果'}`);
       notifyRenderer();
     })
-    .catch(() => { if (child) { current.speed = { failed: true }; notifyRenderer(); } });
+    .catch(() => { if (alive()) { current.speed = { failed: true }; notifyRenderer(); } });
 }
 
 /**
@@ -167,58 +261,27 @@ function localAddresses(port) {
 /**
  * 找出正在监听某个端口的进程 PID。
  *
- * 为什么需要它:停止按钮原来只能停掉"本外壳 spawn 过的"那个子进程。可现实里
- * 8091 上跑的可能是**别的来源**起的 llama-server(手动起的、脚本起的、
- * 调试时起的)——这时点「停止」是空操作,界面却还显示"运行中",因为
- * `/health` 确实能通。实测就这么留下一只占着 7.3 GB 显存的幽灵服务,
- * 关掉软件再打开也照样"运行中"。
- *
- * 用 netstat 而不是 PowerShell 的 Get-NetTCPConnection:后者在非提权下会被拒。
- * stdio 接文件 —— 这个仓库里所有子进程调用都不能用管道。
+ * 现在委托给 core/ports：它不看本地化的状态词，只认"外部端口为 0 且 PID > 0"，
+ * 所以在中文/其它语言的 Windows 上同样可靠。保留这个导出是因为
+ * tools/test_proxy_managed.mjs 直接断言过它。
  */
 function pidOnPort(port) {
-  const tmp = path.join(LOG_DIR, `_netstat-${process.pid}.txt`);
-  let fd;
-  try {
-    fs.mkdirSync(LOG_DIR, { recursive: true });
-    fd = fs.openSync(tmp, 'w');
-  } catch { return null; }
-  try {
-    execFileSync('netstat', ['-ano', '-p', 'TCP'], {
-      stdio: ['ignore', fd, fd],
-      windowsHide: true,
-      timeout: 15000,
-    });
-  } catch { /* 命令失败时按"查不到"处理 */ }
-  try { fs.closeSync(fd); } catch { /* 已关 */ }
-  let text = '';
-  try { text = fs.readFileSync(tmp, 'utf8'); } catch { /* 没读到 */ }
-  try { fs.unlinkSync(tmp); } catch { /* 删不掉无所谓 */ }
-
-  // 只认 LISTENING 那一行。TIME_WAIT 的本地地址也带端口,但 PID 是 0。
-  const re = new RegExp(`^\\s*TCP\\s+\\S+:${port}\\s+\\S+\\s+LISTENING\\s+(\\d+)\\s*$`, 'i');
-  for (const line of text.split(/\r?\n/)) {
-    const m = line.match(re);
-    if (m) return Number(m[1]);
-  }
-  return null;
+  return ports.pidOnPort(port);
 }
 
-/** 温和停掉一个进程:先 kill,8 秒不退就强杀。 */
+/** 温和停掉一个进程:先 kill,8 秒不退就强杀（测试与代理清理还在用）。 */
 function killPid(pid, graceMs = 8000) {
   return new Promise((resolve) => {
     let dead = false;
     const done = () => { if (!dead) { dead = true; resolve(); } };
-    try { process.kill(pid); } catch { return done(); }   // 已经没了
+    if (!ports.pidAlive(pid)) return done();
+    try { process.kill(pid); } catch { return done(); }
     const t = setTimeout(() => {
       try { process.kill(pid, 'SIGKILL'); } catch { /* 已经没了 */ }
       done();
     }, graceMs);
-    // 轮询确认它真的走了;process.kill(pid, 0) 只是探活,不会真的发信号
     const tick = setInterval(() => {
-      try {
-        process.kill(pid, 0);
-      } catch {
+      if (!ports.pidAlive(pid)) {
         clearInterval(tick);
         clearTimeout(t);
         done();
@@ -230,93 +293,24 @@ function killPid(pid, graceMs = 8000) {
 // ------------------------------------------------------------------ 进程
 
 /**
- * 停掉当前服务。
+ * 停掉当前服务（委托 Supervisor）。
  *
- * 两个来源都要覆盖:
- *   1. `child` —— 本外壳 spawn 的(正常路径)
- *   2. 端口上实际监听的那个 —— 可能是外部起的(`child` 为 null 时)
- * 少任何一个,都会出现"点了停止但服务还在跑"。
+ * 覆盖两种来源：
+ *   1. 本外壳 spawn 的 handle —— 正常路径；
+ *   2. 上次端口上实际监听的外部进程 —— Supervisor 在没有 handle 时会按
+ *      lastPort 认领，避免"点了停止但服务还在跑"。
  */
-function stopServer() {
-  return new Promise((resolve) => {
-    const tracked = child;
-    child = null;
-    current = { ...EMPTY_CURRENT };
-
-    // 先把可能的外部监听者也找出来。注意要在动手杀之前查,否则端口一空就查不到了。
-    const adopted = tracked ? null : pidOnPort(PORT);
-
-    const pids = [];
-    if (tracked && tracked.pid) pids.push(tracked.pid);
-    if (adopted) pids.push(adopted);
-
-    // 台账只留仍然活着的;这样万一外壳中途退出,下次启动还能收掉它们。
-    writeLedger(pids);
-
-    if (!pids.length) return resolve({ stopped: [] });
-
-    if (tracked) { try { tracked.kill(); } catch { /* 已经没了 */ } }
-
-    Promise.all(pids.map((pid) => killPid(pid))).then(() => {
-      writeLedger([]);
-      if (adopted) {
-        console.log(`[shell] 停止:8091 上的监听者不是本外壳启动的,PID ${adopted} 已结束`);
-      }
-      resolve({ stopped: pids, adopted: !!adopted });
-    });
-  });
-}
-
-/**
- * 外壳自己 spawn 过的服务进程的 PID 台账。
- *
- * 为什么需要:子进程用 detached 启动(外壳崩了它也能活,这是有意的),
- * 但外壳重启后 `child` 变量是 null,stopServer() 就成了空操作 ——
- * 旧进程永远留着。实测后果很严重:两个 llama-server 同时抢 8 GB 显存,
- * 第二个被挤到系统内存,生成速度从 43 t/s 掉到 3.5 t/s;而且旧的那个会
- * 变成"进程活着但不监听端口"的僵尸,手机连上去只会一直转圈。
- *
- * 为什么用台账而不是查进程表:查进程表要么依赖 WMI(受限环境里查不到),
- * 要么按进程名匹配 —— 那就可能连**用户自己在别的端口上手动跑的服务**一起
- * 杀掉。台账只记录我们自己启动过的 PID,精确且不会误伤。
- * PID 会被系统复用,但配合"启动时清理"这个时机,风险可以忽略。
- */
-function ledgerPath() {
-  return path.join(LOG_DIR, 'running-pids.json');
-}
-
-function readLedger() {
-  try {
-    const v = JSON.parse(fs.readFileSync(ledgerPath(), 'utf8'));
-    return Array.isArray(v) ? v.filter((n) => Number.isInteger(n) && n > 0) : [];
-  } catch {
-    return [];
-  }
-}
-
-function writeLedger(pids) {
-  try {
-    fs.mkdirSync(LOG_DIR, { recursive: true });
-    fs.writeFileSync(ledgerPath(), JSON.stringify(pids), 'utf8');
-  } catch { /* 台账写不了也不该阻断服务 */ }
-}
-
-/**
- * 清掉外壳上次遗留的服务进程。
- * 只看台账里记过的 PID,因此绝不会碰到用户手动启动的 llama-server。
- */
-function killLeftoverServers() {
-  const pids = readLedger();
-  const killed = [];
-  for (const pid of pids) {
-    try {
-      process.kill(pid);
-      killed.push(pid);
-    } catch { /* 已经不在了,正常 */ }
-  }
-  writeLedger([]);
-  if (killed.length) console.log(`[shell] 清掉了 ${killed.length} 个上次遗留的服务进程: ${killed.join(', ')}`);
-  return killed;
+async function stopServer() {
+  current = { ...EMPTY_CURRENT };
+  const sup = ensureSupervisor();
+  // 保留旧版行为：即使本次进程从没 start 过（外壳刚重启、8091 上是别处起的
+  // llama-server），「停止」也要能把上次端口上的监听者收掉。
+  // Supervisor 在没有 handle 时按 lastPort 认领；这里在空闲态把 lastPort
+  // 初始化成配置的起始端口，等价于旧版的 pidOnPort(8091)。
+  if (!sup.handle && sup.lastPort == null) sup.lastPort = configuredBasePort();
+  const r = await sup.stop();
+  if (r.adopted) appendShellLog(`[shell] 停止:上次端口上的监听者不是本外壳启动的,PID ${r.stopped.join(', ')} 已结束`);
+  return r;
 }
 
 /** 拉起服务并等它就绪。
@@ -326,93 +320,99 @@ function killLeftoverServers() {
  *  ctx 是上下文滑块的取值(token)。null/空 => 用预设自带的 ctx。
  *  kv 是 KV cache 精度键名('q4_0' / 'q8_0'),非法值回落到默认。
  *  两者的合法性都由 config.js 的 buildArgs() 统一裁决 —— 界面只是提出意向,
- *  不做为最终决定,免得"漏校验一次 = 静默慢 8 倍"。 */
+ *  不做为最终决定,免得"漏校验一次 = 静默慢 8 倍"。
+ *
+ * 端口不再写死：Supervisor 先扫描空闲端口，再把端口交给 argsForPort(port)。
+ * 因此 buildArgs() 的语义完全不变（argv 快照测试照旧），只是第 3 个参数
+ * 从常量变成了本次实际选中的端口。 */
 async function startServer(modelId, presetKey, reasoningKey, lanMode, budgetKey, ctx, kv) {
   await stopServer();
 
   const model = MODELS.find((m) => m.id === modelId);
   if (!model) throw new Error(`未知的模型标识: ${modelId}`);
+  if (!PRESETS[presetKey]) throw new Error(`未知的预设: ${presetKey}`);
   if (!modelExists(model)) throw new Error(`模型文件不存在:\n${model.file}`);
   if (!binExists(model)) throw new Error(`llama-server 不存在:\n${model.bin}`);
 
-  // 外壳重启后 stopServer() 是空操作,先按台账清掉上次遗留的进程再占显存。
-  killLeftoverServers();
-
   const apiKey = (settings.readSettings().apiKey || '').trim();
-  const args = buildArgs(model, presetKey, PORT, reasoningKey, lanMode, apiKey, budgetKey, { ctx, kv });
+  let spawnedArgs = null;
+  const sup = ensureSupervisor();
 
-  fs.mkdirSync(LOG_DIR, { recursive: true });
-  logFile = path.join(LOG_DIR, `shell-${modelId}.log`);
-  // 日志要能给人看,但 Key 不该留在磁盘上明晃晃摆着。
-  // 只替换显示用的这一份,真正传给进程的 argv 不动。
-  const shown = args.map((a, i) => (i > 0 && args[i - 1] === '--api-key' ? '<已隐藏>' : a));
-  const banner = `[shell] ${new Date().toISOString()}\n[shell] ${model.bin}\n[shell] ${shown.join(' ')}\n`;
-  fs.writeFileSync(logFile, banner, 'utf8');
-  const out = fs.openSync(logFile, 'a');
+  let st;
+  try {
+    // Supervisor.start() 内部会先 cleanupLeftovers()：只杀台账里且启动时间
+    // 核对得上的进程，所以不会再误伤用户手动起的服务。
+    st = await sup.start({
+      exe: model.bin,
+      modelId,
+      preset: presetKey,
+      argsForPort: (port) => {
+        spawnedArgs = buildArgs(model, presetKey, port, reasoningKey, lanMode, apiKey, budgetKey, { ctx, kv });
+        return spawnedArgs;
+      },
+    });
+  } catch (e) {
+    const tail = (e && Array.isArray(e.logTail) && e.logTail.length)
+      ? e.logTail
+      : readLogTail(14);
+    throw new Error(`服务启动失败或超时:${e.message}` +
+      (tail.length ? `\n日志末尾:\n${tail.join('\n')}` : ''));
+  }
 
-  // detached: 外壳崩了子进程也能活,而不是被一起带走。
-  // stdio 走文件,永远不走管道。
-  child = spawn(model.bin, args, {
-    windowsHide: true,
-    detached: true,
-    stdio: ['ignore', out, out],
-  });
-  // 记进 current 的是**真正生效**的值,不是界面传进来的意向值 ——
-  // buildArgs() 可能把它吸附到了别的档位、或把非法 KV 键名回落成了默认,
+  // 记进 current 的是**真正生效**的值，不是界面传进来的意向值 ——
+  // buildArgs() 可能把非法 KV 键名回落成默认、把预设 ctx 夹到安全上限，
   // 状态栏必须显示实际值。
+  const args = spawnedArgs || [];
   const ctxIdx = args.indexOf('-c');
   const effectiveCtx = ctxIdx >= 0 ? Number(args[ctxIdx + 1]) : null;
   const kIdx = args.indexOf('-ctk');
   const effectiveKv = kIdx >= 0 ? args[kIdx + 1] : null;
-  current = { modelId, preset: presetKey, reasoning: reasoningKey || null, budget: budgetKey || null, ctx: effectiveCtx, kv: effectiveKv, speed: null, lanMode: !!lanMode, startedAt: Date.now() };
+  current = {
+    modelId,
+    preset: presetKey,
+    reasoning: reasoningKey || null,
+    budget: budgetKey || null,
+    ctx: effectiveCtx,
+    kv: effectiveKv,
+    speed: null,
+    lanMode: !!lanMode,
+    startedAt: st.startedAt || Date.now(),
+  };
+  appendShellLog(`[shell] 服务就绪 ${st.url} (端口 ${st.port}, PID ${st.pid})`);
 
-  // 记进台账:万一外壳非正常退出,下次启动能靠它把这个进程收掉。
-  if (child.pid) writeLedger([child.pid]);
-
-  // 子进程已经有自己的句柄了;我们继续持有会每次启动漏一个 fd。
-  try { fs.closeSync(out); } catch {}
-  try { child.unref(); } catch {}
-
-  child.on('error', (err) => {
-    try { fs.appendFileSync(logFile, `[shell] 启动子进程失败: ${err.message}\n`); } catch {}
-  });
-
-  child.on('exit', (code) => {
-    try { fs.appendFileSync(logFile, `[shell] 服务退出,code=${code}\n`); } catch {}
-    writeLedger([]);
-    if (child) { child = null; current = { ...EMPTY_CURRENT }; }
-    notifyRenderer();
-  });
-
-  const ok = await waitForHealth();
-  if (!ok) {
-    const tail = readLogTail(14).join('\n');
-    await stopServer();
-    throw new Error(`服务启动失败或超时。日志末尾:\n${tail}`);
-  }
-  try { fs.appendFileSync(logFile, '[shell] 服务就绪\n'); } catch {}
-
-  // 局域网模式下顺手确保代理也在跑。
+  // 代理必须跟着 llama 的**动态端口**走：PROXY_TARGET 指向当前 handle 的 URL。
+  // 不做成"代理跟着服务一起停"——代理很轻，停掉只会让手机连到一个没有档位/
+  // 没有压缩的地址；服务不在时它会如实返回 502。
   //
-  // 不做成"代理跟着服务一起停":代理很轻,而且停掉它只会让手机连到
-  // 一个没有档位/没有压缩的地址。让它活着,服务不在时它会如实返回 502。
-  if (lanMode) {
+  // LAN 模式下确保代理起来；本地模式下如果代理本来就在跑，也要刷新目标
+  //（上一轮可能是另一个动态端口）。
+  if (lanMode || proxyChild) {
     try {
-      const pr = await startProxy();
+      const pr = await startProxy({ refresh: true });
       if (!pr.ok) {
-        // 代理起不来不能让整个服务启动失败 —— 8051 本身是可用的。
-        try { fs.appendFileSync(logFile, `[shell] 代理未能启动:${pr.error || '(未知)'}\n`); } catch {}
+        // 代理起不来不能让整个服务启动失败 —— llama-server 本身是可用的。
+        appendShellLog(`[shell] 代理未能启动:${pr.error || '(未知)'}`);
       }
     } catch (e) {
-      try { fs.appendFileSync(logFile, `[shell] 代理启动异常:${e.message}\n`); } catch {}
+      appendShellLog(`[shell] 代理启动异常:${e.message}`);
     }
   }
 
-  // 探针放最后、且不 await —— 它要花二三十秒建 CUDA 图,不该拖住"启动完成"。
-  // 界面先显示运行中,结果出来后再由 notifyRenderer 补上速度那一行。
-  runProbe(model);
+  // 探针放最后、且不 await —— 它要花几十秒建 CUDA 图，不该拖住"启动完成"。
+  // 界面先显示运行中，结果出来后再由 notifyRenderer 补上速度那一行。
+  runProbe(model, st.url);
 
-  return { url: `${BASE}/`, modelId, preset: presetKey, reasoning: current.reasoning, budget: current.budget, ctx: current.ctx, kv: current.kv, lanMode: current.lanMode };
+  return {
+    url: st.url,
+    port: st.port,
+    modelId,
+    preset: presetKey,
+    reasoning: current.reasoning,
+    budget: current.budget,
+    ctx: current.ctx,
+    kv: current.kv,
+    lanMode: current.lanMode,
+  };
 }
 
 // ------------------------------------------------------------------ 渲染层
@@ -420,6 +420,53 @@ async function startServer(modelId, presetKey, reasoningKey, lanMode, budgetKey,
 function notifyRenderer() {
   if (win && !win.isDestroyed()) win.webContents.send('state-changed');
 }
+
+/** 当前 llama-server 的源（scheme + host + port）；没有服务时为 null。 */
+function serviceOrigin() {
+  const st = serviceStatus();
+  if (!st || !st.url) return null;
+  try { return new URL(st.url).origin; } catch { return null; }
+}
+
+/**
+ * webview 只允许停在当前 llama-server 的源上。
+ *
+ * 为什么：聊天页面里的链接、模型返回的 markdown、甚至一次误点的广告，
+ * 都不该把内嵌浏览器带到一个任意站点 —— 那个 webview 虽然关了 Node 集成，
+ * 但它仍同处一个桌面窗口，跳出去后用户很难再回来。
+ *
+ * about:blank 是外壳自己用来复位/隐藏空页的，必须放行。
+ */
+function isAllowedWebviewUrl(raw) {
+  const url = String(raw || '');
+  if (url === 'about:blank') return true;
+  const origin = serviceOrigin();
+  if (!origin) return false;
+  try { return new URL(url).origin === origin; } catch { return false; }
+}
+
+/**
+ * 拦截 webview 的导航/弹窗。
+ *
+ * 事件挂在 app 的 web-contents-created 上，而不是 win.webContents ——
+ * <webview> 的 WebContents 是独立创建的，只有这个时机能拿到。
+ */
+app.on('web-contents-created', (_event, contents) => {
+  if (!contents || typeof contents.getType !== 'function' || contents.getType() !== 'webview') return;
+
+  contents.on('will-navigate', (event, url) => {
+    if (isAllowedWebviewUrl(url)) return;
+    event.preventDefault();
+    appendShellLog(`[shell] 已拦截 webview 导航: ${url}`);
+  });
+
+  if (typeof contents.setWindowOpenHandler === 'function') {
+    contents.setWindowOpenHandler(({ url }) => {
+      appendShellLog(`[shell] 已拦截 webview 弹窗: ${url}`);
+      return { action: 'deny' };
+    });
+  }
+});
 
 function createWindow() {
   win = new BrowserWindow({
@@ -438,6 +485,24 @@ function createWindow() {
     },
   });
   win.setMenuBarVisibility(false);
+
+  // 附加一层 webview 属性收紧：即使渲染层以后又写回 preload/allowpopups，
+  // 这里也会在挂载前把它们清掉。allowpopups 已经在 index.html 删除，
+  // setWindowOpenHandler 再兜底拒绝所有 window.open。
+  if (win.webContents && typeof win.webContents.on === 'function') {
+    win.webContents.on('will-attach-webview', (event, webPreferences, params) => {
+      try {
+        delete webPreferences.preload;
+        webPreferences.nodeIntegration = false;
+        webPreferences.contextIsolation = true;
+      } catch { /* 只读属性之类，忽略 */ }
+      if (!isAllowedWebviewUrl(params && params.src)) {
+        event.preventDefault();
+        appendShellLog(`[shell] 已拦截 webview 挂载: ${params && params.src}`);
+      }
+    });
+  }
+
   win.loadFile(path.join(__dirname, 'index.html'));
   win.on('closed', () => { win = null; });
 }
@@ -483,7 +548,9 @@ ipcMain.handle('catalogue', () => ({
     key: b.key, label: b.label, hint: b.hint, value: b.value,
   })),
   defaultBudget: DEFAULT_REASONING_BUDGET,
-  port: PORT,
+  // 起始端口（不是"当前端口"）。运行中的真实端口从 status IPC 取 ——
+  // 界面用 s.port 更新状态栏与局域网直连地址。
+  port: serviceStatus().port || configuredBasePort(),
 }));
 
 // ------------------------------------------------------------------ 设置 / 局域网
@@ -502,7 +569,7 @@ ipcMain.handle('settings:get', () => {
     // 启动速度探针的开关。默认开 —— 它是唯一能抓出"KV 溢出到内存"的手段,
     // 而那个故障是静默的。关掉只影响"要不要花几十秒探测",不影响使用。
     probe: s.probe !== false,
-    addresses: localAddresses(PORT),
+    addresses: localAddresses(serviceStatus().port || configuredBasePort()),
   };
 });
 
@@ -523,7 +590,7 @@ ipcMain.handle('settings:genkey', () => {
 });
 
 /** 网卡可能中途插拔(开热点就会多一个),所以地址要能刷新。 */
-ipcMain.handle('net:addresses', () => localAddresses(PORT));
+ipcMain.handle('net:addresses', () => localAddresses(serviceStatus().port || configuredBasePort()));
 
 ipcMain.handle('start', async (_e, { modelId, preset, reasoning, lanMode, budget, ctx, kv }) => {
   try {
@@ -540,22 +607,29 @@ ipcMain.handle('stop', async () => {
 });
 
 ipcMain.handle('status', async () => {
-  const health = await httpGet(`${BASE}/health`, 1500);
-  const slots = await httpGet(`${BASE}/slots`, 1500);
+  const st = serviceStatus();
+  // URL 一律来自 Supervisor 的当前 handle。没有运行中的服务时**不要**
+  // 拼一个 8091 之类的地址去请求 —— 那会把"端口上碰巧有别的东西"
+  // 误报成"我们的服务在跑"。
+  const base = st.url || null;
+  const apiKey = (settings.readSettings().apiKey || '').trim();
+  const health = base ? await httpGet(`${base}health`, 1500, apiKey) : { ok: false };
+  const slots = base ? await httpGet(`${base}slots`, 1500, apiKey) : { ok: false };
   let ctx = null;
   if (slots.ok) {
     try { ctx = JSON.parse(slots.body)[0]?.n_ctx ?? null; } catch {}
   }
+  if (!ctx) ctx = current.ctx || null;
   const model = MODELS.find((m) => m.id === current.modelId) || null;
-  // health.ok 只说明"8091 上有东西在应答",不代表它是本外壳管的。
-  // 这两件事必须分开,否则会出现"界面显示运行中,但停止按钮点不动" ——
-  // 实测就是这么留下一只占着 7.3 GB 显存的幽灵服务。
-  const managed = !!child;
+  const managed = st.state === 'ready' && !!st.pid;
   return {
-    running: health.ok,
+    running: !!health.ok,
     managed,
-    // 在跑但不是我们管的时候,如实报出来,界面才能提示"点停止会一并收掉它"
-    external: health.ok && !managed,
+    // Supervisor 只会返回它自己 handle 的 URL；在跑但不是我们管的情况
+    // （例如别的进程占了上次的端口）在 P0 里不再猜，停止按钮由 Supervisor
+    // 按 lastPort 认领收尾。
+    external: false,
+    state: st.state,
     modelId: current.modelId,
     modelName: model ? model.name : null,
     preset: current.preset,
@@ -565,8 +639,10 @@ ipcMain.handle('status', async () => {
     ctx,
     kv: current.kv,
     speed: current.speed,
-    uptimeSec: current.startedAt ? Math.floor((Date.now() - current.startedAt) / 1000) : 0,
-    url: health.ok ? `${BASE}/` : null,
+    uptimeSec: st.startedAt ? Math.floor((Date.now() - st.startedAt) / 1000) : 0,
+    port: st.port || null,
+    pid: st.pid || null,
+    url: health.ok ? base : null,
   };
 });
 
@@ -586,10 +662,15 @@ async function proxyRequest(method, path, body) {
   const url = `${PROXY_BASE}${path}`;
   try {
     const init = { method, signal: AbortSignal.timeout(6000) };
+    const headers = {};
     if (body !== undefined) {
-      init.headers = { 'Content-Type': 'application/json' };
+      headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(body);
     }
+    // 代理启用 /_bridge 会话 token 后，主进程自己的调用也要带。
+    // 未设置 token（直接手工跑代理）时保持免鉴权，本地开发/测试兼容。
+    if (proxyToken) headers['x-bridge-token'] = proxyToken;
+    if (Object.keys(headers).length) init.headers = headers;
     const r = await fetch(url, init);
     const text = await r.text();
     let json = null;
@@ -614,13 +695,17 @@ ipcMain.handle('proxy:status', async () => {
     lastExitCode: proxyState.lastExitCode,
     lastError: proxyState.lastError,
     startedAt: proxyState.startedAt,
+    // 当前代理指向哪个 llama 端口、是否允许局域网访问
+    target: proxyState.target,
+    allowLan: proxyState.allowLan,
     node: proxyNodeExe || findNodeExe(),
   };
   return { ...r, port: PROXY_PORT, lifecycle };
 });
 
 ipcMain.handle('proxy:start', async () => {
-  try { return await startProxy(); } catch (e) { return { ok: false, error: e.message }; }
+  // refresh：llama 可能已经换到另一个动态端口，手工点"启动代理"时也要跟上。
+  try { return await startProxy({ refresh: true }); } catch (e) { return { ok: false, error: e.message }; }
 });
 
 ipcMain.handle('proxy:stop', async () => {
@@ -669,6 +754,15 @@ ipcMain.handle('proxy:setCompression', async (_e, enabled) => {
 let proxyChild = null;
 let proxyIntentionalStop = false;
 let proxyNodeExe = null;
+// /_bridge 的会话 token。整个外壳生命周期内保持同一个值：
+//   - 代理崩溃自动重起后，已经打开的 webview 里注入的还是旧 token，
+//     换 token 会让面板立刻 401，表现成"面板突然点不动了"；
+//   - 它防的是"局域网里别的页面/进程直接调 _bridge"，不是长期凭据。
+// 只有在本进程第一次拉起代理时才生成（要求里的"每次拉起代理时生成"）。
+let proxyToken = null;
+// 当前被管代理的启动参数快照。用于在 llama 动态端口变化 / LAN 开关变化时
+// 判断要不要重启代理 —— 代理的监听地址与目标都是启动期环境变量。
+const proxyRuntime = { target: null, allowLan: false };
 // 正在进行中的启动。见 startProxy 开头的说明:没有它,两处并发调用会各起一个。
 let proxyStartInFlight = null;
 const proxyState = {
@@ -681,7 +775,34 @@ const proxyState = {
   lastExitCode: null,
   lastError: null,
   startedAt: null,
+  // 当前代理的绑定与目标（给界面/日志看，也方便测试断言）
+  target: null,
+  allowLan: false,
 };
+
+/** 生成本次会话的 /_bridge token（32 位十六进制）。 */
+function ensureProxyToken() {
+  if (!proxyToken) proxyToken = crypto.randomBytes(16).toString('hex');
+  return proxyToken;
+}
+
+/**
+ * 这次代理应该指向哪个 llama-server。
+ *
+ * 有运行中的 handle 就用它的 URL；没有时回落到"配置里的起始端口"，
+ * 让代理仍能作为 502 的透明层活着（手机连上时会看到明确的上游不可达）。
+ */
+function desiredProxyTarget() {
+  const st = serviceStatus();
+  if (st.url) return st.url.replace(/\/+$/, '');
+  return `http://127.0.0.1:${configuredBasePort()}`;
+}
+
+/** 代理是否要绑定到局域网：用户显式开了 LAN 模式 **且** 设了 API Key。 */
+function desiredProxyAllowLan() {
+  const s = settings.readSettings();
+  return !!(s.lanMode && String(s.apiKey || '').trim());
+}
 
 function proxyLedgerPath() {
   return path.join(LOG_DIR, 'running-proxy-pid.json');
@@ -707,7 +828,7 @@ function writeProxyLedger(pids) {
  * 清掉外壳上次遗留的代理进程。
  *
  * 单独一份台账文件(而不是和 llama-server 共用 running-pids.json):
- * 共用的话,startServer() 里的 killLeftoverServers() 顺手就把代理杀了 ——
+ * 共用的话,Supervisor 的 cleanupLeftovers() 顺手就把代理杀了 ——
  * 那正是要避免的互相误伤。
  */
 function killLeftoverProxy() {
@@ -916,11 +1037,25 @@ async function firewallStatus() {
  * 同时发生,结果第一次调用的返回值变成 already:true。
  * 所以这里把"正在启动"这件事本身也做成可等待的。
  */
-function startProxy() {
-  if (proxyChild) return Promise.resolve({ ok: true, already: true, managed: true });
+function startProxy(options = {}) {
+  const refresh = !!options.refresh;
+
+  if (proxyChild) {
+    const target = desiredProxyTarget();
+    const allowLan = desiredProxyAllowLan();
+    const changed = proxyRuntime.target !== target || proxyRuntime.allowLan !== allowLan;
+    // 目标端口或监听范围变了才重启；否则幂等返回。
+    if (!refresh || !changed) return Promise.resolve({ ok: true, already: true, managed: true });
+  }
   if (proxyStartInFlight) return proxyStartInFlight;
 
   proxyStartInFlight = (async () => {
+    // 刷新路径：先停掉旧代理（它会清 proxyChild / 台账），再按新目标拉起。
+    if (proxyChild) {
+      appendShellLog('[shell] 代理目标或监听范围变化，重启代理');
+      await stopProxy();
+    }
+
     // 先看端口上有没有现成的代理
     if (await tcpProbe(PROXY_PORT)) {
       const r = await proxyRequest('GET', '/_bridge/status');
@@ -951,6 +1086,11 @@ function startProxy() {
     }
     proxyNodeExe = nodeExe;
 
+    const target = desiredProxyTarget();
+    const allowLan = desiredProxyAllowLan();
+    const token = ensureProxyToken();
+    const apiKey = (settings.readSettings().apiKey || '').trim();
+
     fs.mkdirSync(LOG_DIR, { recursive: true });
     const proxyLog = path.join(LOG_DIR, 'context-proxy.log');
     const fd = fs.openSync(proxyLog, 'a');
@@ -962,17 +1102,24 @@ function startProxy() {
         windowsHide: true,
         detached: true,
         cwd: REPO_ROOT,
-        // ⚠ 2026-09-30:必须把 API key 一起传给代理。代理**自己**会发起两类上游请求:
-        //   ① 读 /props 拿真实 n_ctx  ② 开了自动压缩时调 /v1/chat/completions。
-        //   以前只传了 UPSTREAM 地址,于是这两条全部 401:
-        //     · 界面「上下文」永远显示 —(一直用 65536 兜底,压缩阈值跟着算错)
-        //     · 自动压缩直接失败
-        //   日志里每 15 秒一条 `unauthorized: Invalid API Key` 就是它。
+        // 环境变量是代理唯一的启动期配置入口：
+        //   PROXY_TARGET   当前 llama-server（动态端口，不能再用写死的 8091）
+        //   PROXY_TOKEN    /_bridge 的会话 token（主进程自己的调用与注入面板共用）
+        //   PROXY_ALLOW_LAN 只有用户显式开 LAN 且设了 API Key 才允许绑 0.0.0.0
+        //   UPSTREAM_KEY   代理由自己发起的 /props 与压缩请求需要它
+        // UPSTREAM 仍然传，兼容旧版代理脚本/测试。
         env: {
           ...process.env,
           PROXY_PORT: String(PROXY_PORT),
-          UPSTREAM: BASE,
-          UPSTREAM_KEY: (settings.readSettings().apiKey || '').trim(),
+          PROXY_TARGET: target,
+          UPSTREAM: target,
+          UPSTREAM_KEY: apiKey,
+          PROXY_TOKEN: token,
+          PROXY_ALLOW_LAN: allowLan ? '1' : '0',
+          // 代理自己写日志/状态文件的位置也跟着 paths 走，别再去猜安装目录。
+          // 显式传入的 PROXY_STATE_DIR 优先（tools/test_proxy_managed.mjs 用它
+          // 做状态隔离，绝不能把测试配置写进生产目录）。
+          PROXY_STATE_DIR: process.env.PROXY_STATE_DIR || LOG_DIR,
         },
         stdio: ['ignore', fd, fd],
       });
@@ -986,8 +1133,13 @@ function startProxy() {
     proxyState.managed = true;
     proxyState.external = false;
     proxyState.startedAt = Date.now();
+    proxyState.target = target;
+    proxyState.allowLan = allowLan;
+    proxyRuntime.target = target;
+    proxyRuntime.allowLan = allowLan;
     if (p.pid) writeProxyLedger([p.pid]);
     try { p.unref(); } catch {}
+    appendShellLog(`[shell] 代理已启动: 目标 ${target},监听 ${allowLan ? '0.0.0.0' : '127.0.0.1'}:${PROXY_PORT}`);
 
     p.on('error', (e) => {
       proxyState.lastError = `代理启动失败:${e.message}`;
@@ -1017,7 +1169,7 @@ function startProxy() {
       }
       proxyState.restarts++;
       const delay = Math.min(30000, 1000 * 2 ** (proxyState.restarts - 1));
-      console.log(`[shell] 代理退出(code=${code}),${delay}ms 后第 ${proxyState.restarts} 次重起`);
+      appendShellLog(`[shell] 代理退出(code=${code}),${delay}ms 后第 ${proxyState.restarts} 次重起`);
       setTimeout(() => {
         if (!proxyChild && !proxyIntentionalStop) startProxy().then(() => notifyRenderer()).catch(() => {});
       }, delay);
@@ -1035,9 +1187,9 @@ function startProxy() {
     const t0 = Date.now();
     for (;;) {
       const r = await proxyRequest('GET', '/_bridge/status');
-      if (r.ok) return { ok: true, started: true, node: nodeExe };
+      if (r.ok) return { ok: true, started: true, node: nodeExe, target, allowLan };
       if (exited) {
-        const msg = `代理启动后立刻退出了(退出码 ${proxyState.lastExitCode})。日志末几行在 logs\\context-proxy.log。`;
+        const msg = `代理启动后立刻退出了(退出码 ${proxyState.lastExitCode})。日志末几行在 ${path.join(LOG_DIR, 'context-proxy.log')}。`;
         proxyState.lastError = msg;
         return { ok: false, error: msg, exited: true };
       }
@@ -1067,6 +1219,10 @@ function stopProxy() {
     proxyState.managed = false;
     proxyState.external = false;
     proxyState.startedAt = null;
+    proxyState.target = null;
+    proxyState.allowLan = false;
+    proxyRuntime.target = null;
+    proxyRuntime.allowLan = false;
 
     const tracked = proxyChild;
     proxyChild = null;
@@ -1155,11 +1311,10 @@ if (!gotTheLock) {
 
 app.whenReady().then(async () => {
   if (!gotTheLock) return;   // 第二个实例:不建窗口、不起服务,直接退出
-  // 设置放在 userData 下:更新外壳不会把它冲掉,也不会跟着仓库被提交。
-  // MODEL_STOVE_SETTINGS_DIR 是测试用的覆盖开关 —— 自动化测试需要一个
-  // 可写、可丢弃的位置,不能去动用户真实的 %APPDATA% 设置。
-  const settingsDir = process.env.MODEL_STOVE_SETTINGS_DIR || app.getPath('userData');
-  settings.initSettings(settingsDir);
+  // 路径 / 设置文件 / Supervisor 都在这里定型：
+  //   - dataDir 默认就是 userData（旧设置文件原位，自动迁移）；
+  //   - logsDir 由 paths 决定，不再假设"仓库旁边有一个 logs"。
+  initRuntime();
   createWindow();
 
   // 上次外壳非正常退出可能留下代理进程。按台账收掉,免得它占着 8092
@@ -1173,10 +1328,11 @@ app.whenReady().then(async () => {
   // startProxy() 和外壳的自动启动会同时发生,分不清代理到底是谁拉起来的,
   // 测试就失去了判别力(实测踩过)。
   if (process.env.MODEL_STOVE_NO_AUTO_PROXY === '1') {
-    console.log('[shell] 已按 MODEL_STOVE_NO_AUTO_PROXY 跳过代理自动启动');
+    appendShellLog('[shell] 已按 MODEL_STOVE_NO_AUTO_PROXY 跳过代理自动启动');
   } else {
+    // 默认只绑回环；用户开了 LAN 且设了 Key 时 startProxy 会按 settings 调整。
     startProxy().then((r) => {
-      if (!r.ok) console.log('[shell] 代理未启动:', r.error);
+      if (!r.ok) appendShellLog(`[shell] 代理未启动: ${r.error}`);
       notifyRenderer();
     }).catch(() => {});
   }
@@ -1226,10 +1382,11 @@ app.on('window-all-closed', async () => {
   app.quit();
 });
 
-// 确保子进程不会比外壳活得更久。
+// 确保子进程不会比外壳活得更久（退出流程不等待；完整收尸由 Supervisor 负责）。
 app.on('before-quit', () => {
-  if (child) { try { child.kill(); } catch {} }
-  if (proxyChild) { try { proxyChild.kill(); } catch {} }
+  const st = serviceStatus();
+  if (st.pid) { try { process.kill(st.pid); } catch {} }
+  if (proxyChild) { try { process.kill(proxyChild.pid); } catch {} }
 });
 
 // 仅供 tools/test_shell_load.mjs 使用:把内部函数暴露出来,
@@ -1240,6 +1397,24 @@ module.exports.__test = {
   findNodeExe, killLeftoverProxy, proxyState, tcpProbe, localAddresses,
   // 停止逻辑的两个新依赖:按端口找 PID、温和杀进程。测试要直接验它们。
   pidOnPort, killPid, stopServer,
+  // 启动链路（集成测试用假 spawn 验证"动态端口 → buildArgs → Supervisor"）。
+  startServer,
   // 取当前被管进程的 PID(测试用来核对按端口找到的是不是同一个)
   proxyChildPid: () => (proxyChild ? proxyChild.pid : null),
+  // 带 /_bridge token 的内部请求。tools/test_proxy_managed.mjs 直接用它，
+  // 这样测试不需要知道 token 本身。
+  proxyRequest,
+  // 让测试能确认"主进程确实生成了 token 并随代理启动传下去"。
+  proxyBridgeToken: () => proxyToken,
+  // 路径/监管状态（诊断与集成测试用）
+  runtime: () => ({
+    paths: paths ? {
+      installDir: paths.installDir,
+      dataDir: paths.dataDir,
+      dataSource: paths.dataSource,
+      logsDir: paths.logsDir,
+      settingsFile: settings.currentFile(),
+    } : null,
+    supervisor: serviceStatus(),
+  }),
 };
