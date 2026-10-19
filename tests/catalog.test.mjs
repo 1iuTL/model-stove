@@ -463,7 +463,10 @@ test('真实模型目录：discoverCatalog 发现模型并配对 mmproj（不存
   assert.equal(merged.available, true);
   assert.equal(merged.overrides.safeCtx.q4_0, 163840);
   assert.equal(merged.overrides.probeTps, 50);
-  assert.deepEqual(merged.overrides.extraArgs, ['--n-cpu-moe', '23', '-t', '12']);
+  // extraArgs 与 config.js 保持一致即可（别在这里写死 ncm 档位：那会随实测调整，
+  // 2026-10-19 就因 b11669 构建下 160K 溢出把 ncm 从 23 调到了 24）。
+  const cfgQwen38 = cfg.MODELS.find((m) => m.id === 'qwen38distill-abl');
+  assert.deepEqual(merged.overrides.extraArgs, cfgQwen38.extraArgs);
 
   console.log('[真实目录]', JSON.stringify({
     dir: REAL_DIR,

@@ -302,10 +302,13 @@ try {
   check('runtimeModels：legacy 模型保留旧 id 与 legacyId',
     !!rtLegacy && rtLegacy.legacyId === 'qwen38distill-abl',
     rtLegacy ? String(rtLegacy.legacyId) : '(缺失)');
+  // 用 config.js 里的值做基准，不写死 ncm 档位：档位会随实测调整
+  //（2026-10-19 因 b11669 下 160K 溢出，ncm 从 23 改成了 24）。
+  const cfgLegacy = cfg.MODELS.find((m) => m.id === 'qwen38distill-abl');
   check('runtimeModels：legacy 的 extraArgs/probeTps 从 overrides 取',
     !!rtLegacy && Array.isArray(rtLegacy.extraArgs)
-      && rtLegacy.extraArgs.join(' ') === '--n-cpu-moe 23 -t 12'
-      && rtLegacy.probeTps === 50,
+      && JSON.stringify(rtLegacy.extraArgs) === JSON.stringify(cfgLegacy.extraArgs)
+      && rtLegacy.probeTps === cfgLegacy.probeTps,
     rtLegacy ? `${JSON.stringify(rtLegacy.extraArgs)} probeTps=${rtLegacy.probeTps}` : '');
 
   // ---- 启动 / 停止 --------------------------------------------------------
