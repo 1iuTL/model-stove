@@ -377,6 +377,15 @@
               但第一条消息本来也要付这笔钱。关掉可省这段时间。</span>
           </span>
         </label>
+        <label class="opt" style="padding:4px 0">
+          <input type="checkbox" id="optKeepServerOnClose" />
+          <span class="txt">
+            <b>关闭窗口时保留服务（托盘）</b>
+            <span>开启后点关闭只是隐藏窗口,llama-server 继续运行;从托盘可以重新打开或
+              停止服务并退出。关闭它则恢复旧行为:关窗即停服务并退出。
+              托盘不可用时仍会退回关窗退出。</span>
+          </span>
+        </label>
       </div>
     </div>
   </div>
@@ -1074,7 +1083,7 @@ async function doStop() {
 
 // ------------------------------------------------------------------ 设置面板
 
-let SETTINGS = { apiKey: '', lanMode: false, addresses: [] };
+let SETTINGS = { apiKey: '', lanMode: false, probe: true, keepServerOnClose: true, addresses: [] };
 
 /**
  * 重画局域网地址列表。
@@ -1198,6 +1207,7 @@ async function loadSettingsToUi() {
   $('optLan').checked = !!SETTINGS.lanMode;
   // 主进程缺省返回 true(没设过 = 开),这里如实反映,不要自己再兜一层默认。
   $('optProbe').checked = SETTINGS.probe !== false;
+  $('optKeepServerOnClose').checked = SETTINGS.keepServerOnClose !== false;
   renderLan();
 }
 
@@ -1387,7 +1397,21 @@ function flash(id, text) {
 
 async function showLogs() {
   const lines = await window.shell.logs();
-  $('log').textContent = lines.length ? lines.join('\n') : '(暂无日志)';
+  // 热接管时日志来自旧外壳的日志文件(主进程按台账里的 logFile 读)。
+  // 文件不存在是正常情况(可能已被清理),此时 logs 返回空数组 ——
+  // 这里补一句来源说明,别让用户以为「日志」按钮坏了。
+  let emptyText = '(暂无日志)';
+  if (!lines.length) {
+    try {
+      const s = await window.shell.status();
+      if (s && s.adopted) {
+        emptyText = s.logAvailable
+          ? `(暂无日志:${s.logFile || '上次的日志文件'} 目前是空的)`
+          : `(热接管的服务:上次日志不可用${s.logFile ? `(${s.logFile})` : '(旧台账没有记录 logFile)'},无法显示历史输出)`;
+      }
+    } catch { /* 状态查不到时保留默认说明 */ }
+  }
+  $('log').textContent = lines.length ? lines.join('\n') : emptyText;
   $('logwrap').classList.add('show');
   $('log').scrollTop = $('log').scrollHeight;
 }
@@ -1425,6 +1449,14 @@ async function showLogs() {
     const r = await window.shell.setSettings({ probe: e.target.checked });
     if (r) SETTINGS.probe = r.probe !== false;
     $('optProbe').checked = SETTINGS.probe;
+  };
+
+  // 关窗保活开关。主进程每次 close 都重新读设置,所以保存后立即生效,
+  // 不需要重启服务或外壳。写失败时把复选框恢复成主进程返回的状态。
+  $('optKeepServerOnClose').onchange = async (e) => {
+    const r = await window.shell.setSettings({ keepServerOnClose: e.target.checked });
+    if (r) SETTINGS.keepServerOnClose = r.keepServerOnClose !== false;
+    $('optKeepServerOnClose').checked = SETTINGS.keepServerOnClose;
   };
 
   // 上下文滑块。用 input 而不是 change —— 拖动过程中就要看到读数与警告变化,
@@ -1534,8 +1566,10 @@ async function showLogs() {
 
   window.shell.onStateChanged(refresh);
   initFrameDiagnostics();
-  // 只轮询侧栏状态,这里不碰 webview。
-  setInterval(refresh, 4000);
+  // 状态变化已经由主进程的 state-changed 事件覆盖(启动/停止/崩溃/热接管)。
+  // 轮询只作为兜底:事件丢失(窗口重载、监听器异常)时仍能自行恢复。
+  // 所以放宽到 10 秒,减少无谓的 IPC 与 /health 请求;这里不碰 webview。
+  setInterval(refresh, 10000);
 
   // 代理是外壳托管的进程,但它的在线状态仍要定期重查:
   // 崩了会自动重起,面板不用刷新就能恢复。

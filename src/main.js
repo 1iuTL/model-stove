@@ -186,6 +186,29 @@ function readLogTail(maxLines = 250) {
   return supervisor.readLogTail(undefined, maxLines);
 }
 
+/**
+ * 当前 handle 的日志来源。
+ *
+ * 热接管后 handle.logFile 来自旧台账：文件可能还在（正常读）、也可能被
+ * 清理掉了或旧台账根本没记（返回 []）。把原因单独给出来，界面才能在
+ * 「日志」面板为空时说明"是没日志，而不是坏了"。
+ *
+ * 返回 { file, available, reason }：
+ *   reason = ok | missing-file | no-log-file | no-service | stat-failed
+ */
+function logSourceInfo() {
+  const h = supervisor && supervisor.handle;
+  if (!h) return { file: null, available: false, reason: 'no-service' };
+  const file = h.logFile || null;
+  if (!file) return { file: null, available: false, reason: 'no-log-file' };
+  try {
+    if (!fs.existsSync(file)) return { file, available: false, reason: 'missing-file' };
+  } catch {
+    return { file, available: false, reason: 'stat-failed' };
+  }
+  return { file, available: true, reason: 'ok' };
+}
+
 /** 能力缓存的落点：数据目录下的 cache/capabilities.json。 */
 function capsCacheFile() {
   const base = (paths && paths.cacheDir) || path.join(LOG_DIR, 'cache');
@@ -709,6 +732,12 @@ async function startServer(modelId, presetKey, reasoningKey, lanMode, budgetKey,
       modelId,
       preset: presetKey,
       lanMode: !!lanMode,
+      // P3 补齐：运行参数也进 handle/台账。下次外壳重启热接管时，
+      // current 的 ctx/kv/reasoning/budget 就不用再猜成 null。
+      ctx,
+      kv,
+      reasoning: reasoningKey,
+      budget: budgetKey,
       argsForPort: (port) => {
         // 端口由 Supervisor 动态选出后再拼 argv；参数门控在 buildArgs 外面，
         // 不改变 buildArgs() 的语义（90 例快照仍是逐字节基准）。
@@ -757,6 +786,11 @@ async function startServer(modelId, presetKey, reasoningKey, lanMode, budgetKey,
           modelId,
           preset: presetKey,
           lanMode: !!lanMode,
+          // 降级重试沿用同一组运行参数；台账要保持可还原。
+          ctx,
+          kv,
+          reasoning: reasoningKey,
+          budget: budgetKey,
           argsForPort: (port) => {
             // 重试会拿到新端口，必须在**新端口**上重新生成 argv，
             // 不能直接复用 plan.args（里面是上一次的 --port）。
@@ -1147,8 +1181,8 @@ ipcMain.handle('settings:get', () => {
     // 启动速度探针的开关。默认开 —— 它是唯一能抓出"KV 溢出到内存"的手段,
     // 而那个故障是静默的。关掉只影响"要不要花几十秒探测",不影响使用。
     probe: s.probe !== false,
-    // P3：关窗是否保留服务（默认 true）。界面暂未消费，但先暴露给 IPC，
-    // 后续设置页开关不需要再改主进程契约。
+    // P3：关窗是否保留服务（默认 true）。设置页已有复选框；主进程每次
+    // close 都现读设置，所以改完立即生效，不需要重启外壳。
     keepServerOnClose: s.keepServerOnClose !== false,
     addresses: localAddresses(serviceStatus().port || configuredBasePort()),
   };
@@ -1211,9 +1245,16 @@ ipcMain.handle('status', async () => {
   // modelId 是运行时 id（legacy 条目映射回旧 id），从目录缓存里取名字与摘要。
   const model = runtimeModels().find((m) => m.id === current.modelId) || null;
   const managed = st.state === 'ready' && !!st.pid;
+  // 热接管后日志来自旧台账：把"能不能读、为什么不能读"一并给界面，
+  // 否则日志面板为空时用户分不清是服务没输出还是文件丢了。
+  const logSource = logSourceInfo();
   return {
     running: !!health.ok,
     managed,
+    adopted: !!st.adopted,
+    logFile: logSource.file,
+    logAvailable: logSource.available,
+    logReason: logSource.reason,
     // Supervisor 只会返回它自己 handle 的 URL；在跑但不是我们管的情况
     // （例如别的进程占了上次的端口）在 P0 里不再猜，停止按钮由 Supervisor
     // 按 lastPort 认领收尾。
@@ -1905,9 +1946,9 @@ if (!gotTheLock) {
  * 成功 → 不 spawn、不杀进程，直接把 current 恢复成"运行中"，界面立刻可用；
  * 失败 → 保持未运行，等用户点启动（cleanupLeftovers() 仍会在 start() 里收尸）。
  *
- * ctx/kv/reasoning 只存在于旧外壳的 argv 里，从台账无法还原（也不该猜），
- * 所以置 null 交给界面按模型/预设回落；modelId/preset/lanMode/startedAt
- * 从 adopted status 恢复。
+ * 旧外壳的 ctx/kv/reasoning/budget 与日志文件现在都随台账持久化，所以能
+ * 逐项从台账还原；旧台账缺字段时如实置 null，并把"哪项来自台账、哪项未知"
+ * 写进 shell.log —— 不猜、不静默显示成实际参数。
  */
 async function adoptExistingServer(readyT0 = null) {
   const t0 = Date.now();
@@ -1930,10 +1971,11 @@ async function adoptExistingServer(readyT0 = null) {
   current = {
     modelId: st.modelId || null,
     preset: st.preset || null,
-    reasoning: null,
-    budget: null,
-    ctx: null,
-    kv: null,
+    // 能从台账恢复的就恢复；旧台账没有的键在 status 里是 null。
+    reasoning: st.reasoning ?? null,
+    budget: st.budget ?? null,
+    ctx: st.ctx ?? null,
+    kv: st.kv ?? null,
     speed: null,
     lanMode: !!st.lanMode,
     startedAt: st.startedAt || Date.now(),
@@ -1941,8 +1983,41 @@ async function adoptExistingServer(readyT0 = null) {
   const readyMs = Number.isFinite(readyT0) ? Date.now() - readyT0 : adoptMs;
   appendShellLog(`[shell] 热接管已有服务 pid=${st.pid} port=${st.port} `
     + `(model=${st.modelId || '未知'}, 用时 ${adoptMs}ms, 启动链 ${readyMs}ms)`);
+
+  // 逐项交代来源：能从台账还原的写"（台账）"，缺失的写"未知"。
+  // 这样用户/排障者不需要猜界面里的 ctx 为什么是空的。
+  const fromLedger = (label, value) => (
+    value == null || value === ''
+      ? `${label}=未知（旧台账无此字段）`
+      : `${label}=${value}（台账）`
+  );
+  const startedSource = st.identity === 'strong'
+    ? '台账'
+    : '当前时钟（旧台账无启动时间，弱身份）';
+  appendShellLog(`[shell] 热接管状态还原: ${[
+    fromLedger('modelId', st.modelId),
+    fromLedger('preset', st.preset),
+    fromLedger('reasoning', st.reasoning),
+    fromLedger('budget', st.budget),
+    fromLedger('ctx', st.ctx),
+    fromLedger('kv', st.kv),
+    `lanMode=${!!st.lanMode}（台账）`,
+    `startedAt=${new Date(current.startedAt).toISOString()}（${startedSource}）`,
+  ].join('，')}`);
+
+  // 日志面板要读的是旧外壳那次启动的日志文件（台账里的 logFile）。
+  const logSource = logSourceInfo();
+  if (logSource.available) {
+    appendShellLog(`[shell] 热接管日志: ${logSource.file}（可读）`);
+  } else if (logSource.reason === 'no-log-file') {
+    appendShellLog('[shell] 热接管日志: 未知（旧台账没有 logFile，日志面板将为空）');
+  } else {
+    appendShellLog(`[shell] 热接管日志: ${logSource.file || '路径未知'}`
+      + '（文件不存在或不可读，日志面板返回空）');
+  }
+
   notifyRenderer();
-  return { ...result, adoptMs, readyMs };
+  return { ...result, adoptMs, readyMs, logSource };
 }
 
 app.whenReady().then(async () => {
@@ -2087,6 +2162,9 @@ module.exports.__test = {
   current: () => ({ ...current }),
   adoptExistingServer: (readyT0) => adoptExistingServer(readyT0),
   tryAdopt: (options) => ensureSupervisor().tryAdopt(options),
+  // 热接管后的日志来源（文件是否存在/为什么不可读），供接线测试断言。
+  logSource: () => logSourceInfo(),
+  readLogTail: (maxLines) => readLogTail(maxLines),
   keepServerOnClose,
   isQuitting: () => quitting,
 };

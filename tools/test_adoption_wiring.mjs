@@ -102,6 +102,9 @@ process.kill = function fakeKill(pid, signal) {
 
 const ports = require('../src/core/ports.js');
 const ledgerFile = path.join(LOGS_DIR, 'running-pids.json');
+// 旧外壳留下的 shell 日志：热接管后「日志」面板要能按台账里的 logFile 读到它。
+const OLD_LOG_FILE = path.join(LOGS_DIR, 'server-__wired__-old.log');
+fs.writeFileSync(OLD_LOG_FILE, '[shell] old shell log line\n[shell] second line\n', 'utf8');
 ports.writeLedger(ledgerFile, [{
   pid: FAKE_PID,
   port: httpPort,
@@ -110,6 +113,12 @@ ports.writeLedger(ledgerFile, [{
   modelId: '__wired__',
   preset: 'text-32k',
   lanMode: false,
+  // P3 补齐：运行参数与日志文件也来自台账（旧台账没有这些键时为 null）。
+  logFile: OLD_LOG_FILE,
+  ctx: 65536,
+  kv: 'q4_0',
+  reasoning: 'medium',
+  budget: '32768',
   // 模拟旧格式台账：没有启动时间 → 允许 weak 认领。
   startedAt: null,
 }]);
@@ -198,6 +207,10 @@ try {
   check('接管 PID 来自台账', st.pid === FAKE_PID, String(st.pid));
   check('URL 指向真实健康端口', st.url === `http://127.0.0.1:${httpPort}/`, String(st.url));
   check('没有 spawn 新进程', spawned === null, spawned ? spawned.exe : '');
+  check('status().logFile 来自台账', st.logFile === OLD_LOG_FILE, String(st.logFile));
+  check('status().ctx/kv/reasoning/budget 来自台账',
+    st.ctx === 65536 && st.kv === 'q4_0' && st.reasoning === 'medium' && st.budget === '32768',
+    `ctx=${st.ctx} kv=${st.kv} reasoning=${st.reasoning} budget=${st.budget}`);
 
   const cur = main.__test.current();
   check('current.modelId 已恢复', cur.modelId === '__wired__', String(cur.modelId));
@@ -205,15 +218,30 @@ try {
   check('current.lanMode 已恢复', cur.lanMode === false, String(cur.lanMode));
   check('current.startedAt 已恢复', typeof cur.startedAt === 'number' && cur.startedAt > 0,
     String(cur.startedAt));
-  check('current 的 ctx/kv 保持未知（不猜旧 argv）', cur.ctx === null && cur.kv === null,
-    `ctx=${cur.ctx} kv=${cur.kv}`);
+  check('current.ctx/kv/reasoning/budget 已从台账恢复',
+    cur.ctx === 65536 && cur.kv === 'q4_0' && cur.reasoning === 'medium' && cur.budget === '32768',
+    `ctx=${cur.ctx} kv=${cur.kv} reasoning=${cur.reasoning} budget=${cur.budget}`);
 
-  // 台账必须保留，并回写 modelId/preset（下次重启还能认）。
+  // 「日志」面板：热接管后必须能读到旧外壳那次启动的日志文件。
+  const logSource = main.__test.logSource();
+  check('logSource 指向台账里的旧日志且可读',
+    logSource.file === OLD_LOG_FILE && logSource.available === true,
+    JSON.stringify(logSource));
+  const logLines = handlers.get('logs')();
+  check('logs IPC 读到上次的日志文件', Array.isArray(logLines)
+    && logLines.includes('[shell] old shell log line'), `${logLines.length} 行`);
+
+  // 台账必须保留，并回写 modelId/preset/运行参数（下次重启还能认）。
   const ledger = ports.readLedger(ledgerFile);
   check('台账保留且 PID 不变', ledger.length === 1 && ledger[0].pid === FAKE_PID,
     JSON.stringify(ledger));
   check('台账回写了 modelId/preset', ledger[0] && ledger[0].modelId === '__wired__'
     && ledger[0].preset === 'text-32k', ledger[0] ? `${ledger[0].modelId}/${ledger[0].preset}` : '');
+  check('台账回写了 logFile/ctx/kv/reasoning/budget', ledger[0]
+    && ledger[0].logFile === OLD_LOG_FILE && ledger[0].ctx === 65536
+    && ledger[0].kv === 'q4_0' && ledger[0].reasoning === 'medium'
+    && ledger[0].budget === '32768',
+  ledger[0] ? `${ledger[0].logFile} ctx=${ledger[0].ctx} kv=${ledger[0].kv}` : '');
   check('弱身份台账的 startedAt 仍为 null',
     ledger[0] && ledger[0].startedAt === null, String(ledger[0] && ledger[0].startedAt));
 
