@@ -304,12 +304,16 @@ check('自检同时覆盖 node 与 app', !!(fw && fw.node && fw.app), fw ? Objec
 check('判据来自注册表', !!(fw && fw._source === 'registry'), fw ? `_source=${fw._source}` : '');
 // 这两条规则是实际加过的,注册表里查得到;查不到说明判据又坏了。
 check('node.exe 被识别为已放行', !!(fw && fw.node && fw.node.present), fw && fw.node ? `count=${fw.node.count}` : '');
-// electron 未安装时（本机当前就是）不存在 electron.exe，也就无从查规则；
-// 此时只要求"判据能给出结论"，不把环境缺失当成失败。
-const electronInstalled = !!(fw && fw.app && fs.existsSync(fw.app.program));
-check('electron.exe 规则自检可用' + (electronInstalled ? '' : '(未安装 electron,跳过存在性)'),
-  !!(fw && fw.app) && (!electronInstalled || fw.app.present),
-  fw && fw.app ? `count=${fw.app.count}` : '');
+// electron 规则是否存在取决于用户有没有点过「放行防火墙」——这是**环境状态**，
+// 不是判据是否正确。安装 electron 后 fw.app.program 存在但规则数可能是 0，
+// 所以这里只验证"判据能对 electron.exe 给出结论"（program 可解析、present 是布尔），
+// 不把"本机没加过规则"当成失败。
+const hasAppVerdict = !!(fw && fw.app && typeof fw.app.present === 'boolean'
+  && typeof fw.app.program === 'string' && fw.app.program);
+check('electron.exe 规则自检能给出结论'
+  + (fs.existsSync(fw && fw.app && fw.app.program) ? '(electron 已安装)' : '(electron 未安装)'),
+  hasAppVerdict,
+  fw && fw.app ? `program=${fw.app.program} present=${fw.app.present} count=${fw.app.count}` : '');
 
 console.log('\n--- 台账 ---');
 const ledgerRaw = (() => { try { return fs.readFileSync(LEDGER, 'utf8'); } catch { return '(无)'; } })();
