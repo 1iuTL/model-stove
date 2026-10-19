@@ -184,10 +184,18 @@ class Supervisor extends EventEmitter {
       if (!this.fs.existsSync(exe)) throw new Error(`可执行文件不存在: ${exe}`);
 
       // 4. 每次启动一个独立日志文件，日志面板只看当前这个。
+      //
+      // 文件名必须带**启动时刻**。只用 modelId+generation 时，外壳重启后 generation
+      // 从 1 重新开始、日志又是追加写 —— 上一轮残留的 "listening on" 会被下一次
+      // 就绪判定读到，表现为"刚 start 就 ready，但 /health 拒绝连接"。
+      // （2026-10-19 真实 llama-server 冒烟测试抓到的就是这个。）
       const generation = ++this.generation;
-      const logFile = this._logFileFor(modelId, generation);
+      const startedAt = this.now();
+      const logFile = this._logFileFor(modelId, generation, startedAt);
       const shown = this.maskArgs(args);
-      this._appendText(logFile, `[shell] ${new Date(this.now()).toISOString()}\n[shell] ${exe}\n[shell] ${shown.join(' ')}\n`);
+      this._appendText(logFile, `[shell] ${new Date(startedAt).toISOString()}\n[shell] ${exe}\n[shell] ${shown.join(' ')}\n`);
+      // 就绪判定只看 banner 之后的字节：双保险，防日志被复用/追加时读到旧内容。
+      const logOffset = this._logSize(logFile);
 
       // 5. spawn。stdio 写文件，不用管道：受限环境下管道会让 Electron 主进程原生崩溃。
       let out = null;
@@ -212,7 +220,8 @@ class Supervisor extends EventEmitter {
       // 7. 建不可变句柄。之后所有事件都靠 generation 认领。
       const handle = Object.freeze({
         pid: child.pid,
-        startedAt: this.now(),
+        startedAt,
+        logOffset,
         exe,
         argvHash: hashArgs(args),
         args: shown,
@@ -287,7 +296,10 @@ class Supervisor extends EventEmitter {
   /** 默认就绪判定：先看日志（llama.cpp 就绪时会打印 listening on），再看 /health。 */
   async _defaultReady(handle) {
     try {
-      const text = this.fs.readFileSync(handle.logFile, 'utf8');
+      // 只扫描本次启动之后写入的字节：日志可能是追加的，前面属于上一轮。
+      const buf = this.fs.readFileSync(handle.logFile);
+      const start = Number.isInteger(handle.logOffset) ? handle.logOffset : 0;
+      const text = buf.subarray(start).toString('utf8');
       if (/listening on\s+https?:\/\//i.test(text)) return true;
     } catch {}
     return !!(await this.healthCheck(handle));
@@ -436,11 +448,21 @@ class Supervisor extends EventEmitter {
 
   // -------------------------------------------------------------- 内部
 
-  _logFileFor(modelId, generation) {
+  _logFileFor(modelId, generation, startedAt = this.now()) {
     if (!this.logDir) throw new Error('Supervisor 需要 logDir');
     this.fs.mkdirSync(this.logDir, { recursive: true });
     const safe = String(modelId || 'server').replace(/[^\w.-]+/g, '_');
-    return this.path.join(this.logDir, `server-${safe}-g${generation}.log`);
+    const stamp = new Date(startedAt).toISOString().replace(/[:.]/g, '-');
+    return this.path.join(this.logDir, `server-${safe}-${stamp}-g${generation}.log`);
+  }
+
+  /** 日志文件当前字节数（拿不到按 0）；用于确定"本次启动"的起始偏移。 */
+  _logSize(file) {
+    try {
+      return this.fs.statSync(file).size;
+    } catch {
+      return 0;
+    }
   }
 
   _appendText(file, text) {

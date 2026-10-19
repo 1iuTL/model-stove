@@ -337,6 +337,61 @@ test('start 之前会先清理上次遗留', async () => {
   assert.deepEqual([...alive], [], '旧进程必须被收掉');
 });
 
+// ------------------------------------------- 日志复用/就绪误判（真实测试抓到的回归）
+
+test('start：复用同一日志路径时，不把上一轮的 listening on 当成就绪', async () => {
+  const sharedLogDir = path.join(tmpDir(), 'logs');
+  const sharedLedger = path.join(tmpDir(), 'running-pids.json');
+  const FIXED_NOW = 1792386000000;
+  // 时钟必须"每 tick 前进一步"：Supervisor 同时用 now() 算日志文件名和就绪截止时间，
+  // 完全冻结的时钟会让 _pollReady 的 deadline 永远追不上（测试自己会挂住）。
+  // 每个 Supervisor 各用一个从 FIXED_NOW 起步的时钟 → 文件名仍会撞上，正好覆盖回归。
+  const makeClock = () => {
+    let t = FIXED_NOW;
+    return () => { const v = t; t += 5; return v; };
+  };
+
+  // 第一轮：假服务真的打印 listening on，ready 正常。
+  const fake1 = fakeSpawn((child, exe, args, opts) => {
+    fs.writeSync(opts.stdio[1], 'main: server is listening on http://127.0.0.1:8123\n');
+  });
+  const shared = { logDir: sharedLogDir, ledgerFile: sharedLedger };
+  const sup1 = makeSup({ ...shared, now: makeClock(), spawn: fake1.spawn });
+  await sup1.start(basicParams());
+  assert.equal(sup1.status().state, STATE.READY);
+  const staleLog = sup1.handle.logFile;
+  assert.ok(fs.readFileSync(staleLog, 'utf8').includes('listening on'));
+  await sup1.stop();
+
+  // 第二轮：同一个 logDir + 同一个注入时钟 → 文件名会撞上；
+  // 新进程不打印 listening on、/health 也探测不到，正确行为是超时而不是 ready。
+  const sup2 = makeSup({
+    ...shared,
+    now: makeClock(),
+    spawn: fakeSpawn().spawn,
+    isReady: undefined,
+    healthCheck: async () => false,
+    readyTimeoutMs: 150,
+    readinessPollMs: 10,
+  });
+  await assert.rejects(() => sup2.start(basicParams()), /启动超时/);
+  assert.equal(sup2.status().state, STATE.ERROR);
+});
+
+test('start：日志文件名带启动时刻，每次启动独立', async () => {
+  const sup = makeSup({ spawn: fakeSpawn().spawn });
+  await sup.start(basicParams());
+  const first = sup.handle.logFile;
+  await sup.stop();
+  await sup.start(basicParams());
+  const second = sup.handle.logFile;
+  assert.notEqual(first, second);
+  assert.match(
+    path.basename(first),
+    /^server-onbit-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-g1\.log$/,
+  );
+});
+
 // ---------------------------------------------------------------- 工具函数
 
 test('defaultMaskArgs：只遮 --api-key 的值', () => {
