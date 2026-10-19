@@ -20,6 +20,7 @@
     "gen:argv": "node tools/gen_argv_baseline.mjs"
   },
   "devDependencies": {
-    "electron": "^43.4.0"
+    "electron": "^43.4.0",
+    "electron-builder": "^26.15.3"
   }
 }

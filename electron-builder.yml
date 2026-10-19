@@ -1,0 +1,28 @@
+appId: com.modelstove.app
+productName: Model Stove
+
+directories:
+  output: dist
+
+# Reuse the Electron already downloaded inside node_modules instead of
+# downloading a fresh copy from GitHub releases.
+electronDist: node_modules/electron/dist
+
+npmRebuild: false
+asar: true
+
+files:
+  - src/**/*
+  - context-proxy.mjs
+  - ui-inject.mjs
+  - icon-256.png
+  - LICENSE
+  - README.md
+  - package.json
+
+win:
+  target:
+    - dir
+  # Do not sign / patch Win32 resources, so winCodeSign + rcedit are not
+  # downloaded. This build is only an unpacked-directory feasibility probe.
+  signAndEditExecutable: false
