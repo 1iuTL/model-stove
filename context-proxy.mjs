@@ -21,6 +21,15 @@
 //   PROXY_TOKEN     /_bridge 的会话 token；设置后所有 _bridge 请求必须带上
 //   UPSTREAM_KEY    上游开了 --api-key 时，代理自己发起的请求要带它
 //   COMPRESS=0      启动时关闭压缩(也可用 _bridge 接口在运行时切换)
+//
+// P1 安全接线(可选；不设置时保持旧行为):
+//   PROXY_DEVICE_AUTH=1        启用设备密钥鉴权(只保护 /v1/*、/props、
+//                              /tokenize、/embedding；静态页面不要求)
+//   PROXY_DEVICE_AUTH_STRICT=1 连回环客户端也要求设备密钥(测试用；
+//                              默认回环豁免，保证本机 UI 不被破坏)
+//   PROXY_RATE_CAPACITY        按 IP 的令牌桶容量，默认 60
+//   PROXY_RATE_REFILL_PER_SEC  每秒补充的令牌数，默认 2
+//   PROXY_STATE_DIR            devices.json / audit.jsonl 与日志、状态文件的目录
 import http from 'node:http'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -32,6 +41,9 @@ import { injectPanel, PANEL_JS, PANEL_SCRIPT_PATH } from './ui-inject.mjs'
 // 这样界面与代理共用同一份定义,不会各自漂移。
 const require = createRequire(import.meta.url)
 const { profiles: PROFILES, defaultProfile, resolve: resolveProfile } = require('./src/profiles.js')
+// P1 安全核心（设备注册表/配对/审计/限流）是 CommonJS，同样用 createRequire 引入。
+const security = require('./src/core/security.js')
+const { AUDIT_EVENTS } = security
 
 // ------------------------------------------------------------------ 配置
 
@@ -88,6 +100,42 @@ function log(...args) {
   const line = `[${new Date().toISOString()}] ${args.join(' ')}`
   console.log(line)
   try { appendFileSync(LOG_FILE, line + '\n', 'utf8') } catch { /* 日志失败不影响服务 */ }
+}
+
+// ------------------------------------------------------------------ P1 安全
+//
+// 设备密钥/配对码/审计/限流的核心实现放在 src/core/security.js(CommonJS)。
+// 这里只做代理层接线：
+//   - PROXY_DEVICE_AUTH 默认关闭，不设时与旧代理行为完全一致；
+//   - 注册表与审计都落在 PROXY_STATE_DIR 下，测试用临时目录隔离；
+//   - 审计 detail 只放原因/方法/路径，绝不写请求体、prompt 或 key。
+const DEVICE_AUTH = process.env.PROXY_DEVICE_AUTH === '1'
+const DEVICE_AUTH_STRICT = process.env.PROXY_DEVICE_AUTH_STRICT === '1'
+// 非法/非正数回落到代理文档里的默认值(而不是核心模块更小的默认值)。
+const rateCapacityRaw = Number(process.env.PROXY_RATE_CAPACITY)
+const RATE_CAPACITY = Number.isInteger(rateCapacityRaw) && rateCapacityRaw > 0 ? rateCapacityRaw : 60
+const rateRefillRaw = Number(process.env.PROXY_RATE_REFILL_PER_SEC)
+const RATE_REFILL_PER_SEC = Number.isFinite(rateRefillRaw) && rateRefillRaw > 0 ? rateRefillRaw : 2
+
+const DEVICES_FILE = path.join(LOG_DIR, 'devices.json')
+const AUDIT_FILE = path.join(LOG_DIR, 'audit.jsonl')
+const deviceRegistry = security.createDeviceRegistry({ file: DEVICES_FILE })
+const pairingService = security.createPairingService({ registry: deviceRegistry })
+const auditLog = security.createAuditLog({ file: AUDIT_FILE })
+const rateLimiter = security.createRateLimiter({
+  capacity: RATE_CAPACITY,
+  refillPerSec: RATE_REFILL_PER_SEC,
+})
+// 启动时顺手清掉过期/已作废的配对码；失败不影响代理启动。
+try { pairingService.pruneExpired() } catch (e) { log(`清理过期配对码失败: ${e.message}`) }
+
+/** 写审计。磁盘满/权限失败只记外壳日志，绝不影响已经通过鉴权的请求。 */
+function auditEvent(event, fields = {}) {
+  try {
+    auditLog.append({ event, ...fields })
+  } catch (e) {
+    log(`审计写入失败(${e.message})`)
+  }
 }
 
 /**
@@ -467,6 +515,312 @@ function readBody(req, limit = MAX_BODY_BYTES) {
   })
 }
 
+// ------------------------------------------------------------------ P1 安全端点/鉴权/限流
+
+const SECURITY_CACHE_HEADERS = { 'Cache-Control': 'no-store' }
+
+/** 新增安全端点统一：no-store + { ok, error } 形状的 JSON。 */
+function sendSecurityJson(res, status, payload) {
+  sendJson(res, status, payload, SECURITY_CACHE_HEADERS)
+}
+
+/** /_security/* 的 401：与 /_bridge 一样不泄露任何细节，且禁用缓存。 */
+function sendSecurityUnauthorized(res) {
+  sendSecurityJson(res, 401, { ok: false, error: 'unauthorized' })
+}
+
+/** 读 JSON 对象请求体；格式非法抛 INVALID_JSON_BODY，超限继续向上抛 413。 */
+async function readJsonObject(req) {
+  const raw = (await readBody(req)).toString('utf8')
+  if (!raw.trim()) return {}
+  const parsed = JSON.parse(raw)
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    const err = new Error('JSON body 必须是对象')
+    err.code = 'INVALID_JSON_BODY'
+    throw err
+  }
+  return parsed
+}
+
+function clientIp(req) {
+  return String((req.socket && req.socket.remoteAddress) || 'unknown')
+}
+
+/** 回环地址判定：默认模式下这些来源不需要设备 key（本机 UI 不受影响）。 */
+function isLoopbackAddress(address) {
+  const value = String(address || '')
+  return value === '127.0.0.1' || value === '::1' || value === '::ffff:127.0.0.1'
+    || value.startsWith('127.') || value.startsWith('::ffff:127.')
+}
+
+/**
+ * 哪些路径需要设备密钥。
+ *
+ * 刻意只保护 API：HTML/面板脚本/静态资源如果也要 key，页面根本打不开。
+ * /slots 在更前面已经 404，这里列上只是表明它也属于 API 面。
+ */
+function isDeviceProtectedPath(urlPath) {
+  return urlPath.startsWith('/v1/')
+    || urlPath === '/props'
+    || urlPath === '/tokenize'
+    || urlPath === '/embedding'
+    || urlPath === '/slots'
+}
+
+/** 设备密钥：x-device-key 优先，其次 Authorization: Bearer。 */
+function readDeviceKey(req) {
+  const header = req.headers['x-device-key']
+  const direct = Array.isArray(header) ? header[0] : header
+  if (typeof direct === 'string' && direct.trim()) return direct.trim()
+  const auth = String(req.headers.authorization || '')
+  if (auth.toLowerCase().startsWith('bearer ')) return auth.slice(7).trim()
+  return ''
+}
+
+// rate_limited 审计按 IP 节流：同一 IP 每 5 秒最多一条，避免 429 刷爆日志。
+const rateLimitAuditAt = new Map()
+const RATE_LIMIT_AUDIT_INTERVAL_MS = 5000
+
+function noteRateLimited(ip, method, urlPath) {
+  const t = Date.now()
+  const last = rateLimitAuditAt.get(ip)
+  if (last != null && t - last < RATE_LIMIT_AUDIT_INTERVAL_MS) return
+  rateLimitAuditAt.set(ip, t)
+  // 内存兜底：大量伪造来源最多保留 4096 条审计节流记录。
+  if (rateLimitAuditAt.size > 4096) {
+    let drop = Math.floor(rateLimitAuditAt.size / 2)
+    for (const key of rateLimitAuditAt.keys()) {
+      rateLimitAuditAt.delete(key)
+      if (--drop <= 0) break
+    }
+  }
+  auditEvent(AUDIT_EVENTS.RATE_LIMITED, { ip, detail: `${method} ${urlPath}` })
+}
+
+/** 按 IP 的令牌桶限流；拒绝时 429 + Retry-After（秒，向上取整、最小 1）。 */
+function enforceRateLimit(req, res, urlPath) {
+  const ip = clientIp(req)
+  if (rateLimiter.take(ip)) return true
+  const retryAfterMs = Number(rateLimiter.retryAfterMs(ip)) || 0
+  const retryAfterSec = Math.max(1, Math.ceil(retryAfterMs / 1000))
+  noteRateLimited(ip, req.method, urlPath)
+  sendJson(res, 429, { ok: false, error: 'rate_limited' }, {
+    ...SECURITY_CACHE_HEADERS,
+    'Retry-After': String(retryAfterSec),
+  })
+  return false
+}
+
+/**
+ * 设备密钥鉴权（只在 PROXY_DEVICE_AUTH=1 时调用）。
+ *
+ * 回环客户端默认豁免；strict 模式下连它们也要 key（测试用）。验证成功后把
+ * Authorization 换成上游自己的 key，并删掉 x-device-key —— 客户端既看不到
+ * llama-server 的 API key，上游日志里也不会出现设备 key。
+ */
+function enforceDeviceAuth(req, res, urlPath) {
+  const ip = clientIp(req)
+  const remote = req.socket ? req.socket.remoteAddress : ''
+  if (!DEVICE_AUTH_STRICT && isLoopbackAddress(remote)) {
+    // 本机豁免：Authorization 原样保留（旧行为），但设备 key 仍不透传上游。
+    delete req.headers['x-device-key']
+    return true
+  }
+
+  const key = readDeviceKey(req)
+  let result
+  try {
+    result = deviceRegistry.verifyKey(key, { ip })
+  } catch (e) {
+    log(`设备密钥校验异常: ${e.message}`)
+    result = { ok: false, reason: 'internal' }
+  }
+
+  if (!result.ok) {
+    // reason 只进审计（invalid/missing/revoked/expired），响应统一不区分。
+    auditEvent(AUDIT_EVENTS.AUTH_FAIL, { ip, detail: `${result.reason} ${req.method} ${urlPath}` })
+    sendUnauthorized(res)
+    return false
+  }
+
+  auditEvent(AUDIT_EVENTS.AUTH_OK, { deviceId: result.device.id, ip, detail: `${req.method} ${urlPath}` })
+  delete req.headers['x-device-key']
+  if (UPSTREAM_KEY) req.headers.authorization = `Bearer ${UPSTREAM_KEY}`
+  else delete req.headers.authorization
+  return true
+}
+
+/** POST /_pair：公开端点，用配对码换设备 key（限流 + 错码上限在核心模块里）。 */
+async function handlePairRequest(req, res) {
+  if (!enforceRateLimit(req, res, '/_pair')) return
+  if (req.method !== 'POST') {
+    sendSecurityJson(res, 405, { ok: false, error: 'method_not_allowed' })
+    return
+  }
+
+  let body
+  try {
+    body = await readJsonObject(req)
+  } catch (e) {
+    if (e && e.code === 'BODY_TOO_LARGE') throw e
+    // 请求体读不懂也属于一次失败的配对尝试（限流已生效，不会刷爆审计）。
+    auditEvent(AUDIT_EVENTS.PAIR_REDEEM_FAIL, { ip: clientIp(req), detail: 'POST /_pair invalid_json' })
+    sendSecurityJson(res, 400, { ok: false, error: 'invalid_json' })
+    return
+  }
+
+  const ip = clientIp(req)
+  let result
+  try {
+    result = pairingService.redeem(body.code, {
+      name: typeof body.name === 'string' ? body.name : undefined,
+      ip,
+    })
+  } catch (e) {
+    log(`配对兑换异常: ${e.message}`)
+    auditEvent(AUDIT_EVENTS.PAIR_REDEEM_FAIL, { ip, detail: 'POST /_pair internal' })
+    sendSecurityJson(res, 401, { ok: false, error: 'unauthorized' })
+    return
+  }
+
+  if (!result.ok) {
+    // 失败原因只写审计，不回显 —— malformed/no-pairing/expired/invalid-code 对外一致。
+    auditEvent(AUDIT_EVENTS.PAIR_REDEEM_FAIL, { ip, detail: `POST /_pair ${result.reason}` })
+    sendSecurityJson(res, 401, { ok: false, error: 'unauthorized' })
+    return
+  }
+
+  auditEvent(AUDIT_EVENTS.PAIR_REDEEM_OK, { ip, deviceId: result.device.id, detail: 'POST /_pair' })
+  // 明文 key 只在这里出现一次：不进日志、不进审计、不落盘。
+  sendSecurityJson(res, 200, {
+    ok: true,
+    deviceId: result.device.id,
+    key: result.device.key,
+    name: result.device.name,
+  })
+}
+
+/** /_security/*：管理端点，必须通过 /_bridge 的 token 规则。 */
+async function handleSecurityRequest(req, res, urlPath) {
+  if (!bridgeAuthorized(req)) {
+    sendSecurityUnauthorized(res)
+    return
+  }
+  if (!enforceRateLimit(req, res, urlPath)) return
+
+  if (urlPath === '/_security/devices') {
+    if (req.method !== 'GET') {
+      sendSecurityJson(res, 405, { ok: false, error: 'method_not_allowed' })
+      return
+    }
+    let devices
+    try {
+      devices = deviceRegistry.listDevices()
+    } catch (e) {
+      log(`读取设备列表失败: ${e.message}`)
+      sendSecurityJson(res, 500, { ok: false, error: 'internal' })
+      return
+    }
+    sendSecurityJson(res, 200, { ok: true, devices })
+    return
+  }
+
+  if (urlPath === '/_security/pairing') {
+    if (req.method !== 'POST') {
+      sendSecurityJson(res, 405, { ok: false, error: 'method_not_allowed' })
+      return
+    }
+    let created
+    try {
+      created = pairingService.createPairing()
+    } catch (e) {
+      log(`生成配对码失败: ${e.message}`)
+      sendSecurityJson(res, 500, { ok: false, error: 'internal' })
+      return
+    }
+    auditEvent(AUDIT_EVENTS.PAIR_CREATE, { ip: clientIp(req), detail: 'POST /_security/pairing' })
+    sendSecurityJson(res, 200, { ok: true, code: created.code, expiresAt: created.expiresAt })
+    return
+  }
+
+  if (urlPath === '/_security/revoke' || urlPath === '/_security/rotate') {
+    if (req.method !== 'POST') {
+      sendSecurityJson(res, 405, { ok: false, error: 'method_not_allowed' })
+      return
+    }
+    let body
+    try {
+      body = await readJsonObject(req)
+    } catch (e) {
+      if (e && e.code === 'BODY_TOO_LARGE') throw e
+      sendSecurityJson(res, 400, { ok: false, error: 'invalid_json' })
+      return
+    }
+    const id = typeof body.id === 'string' ? body.id.trim() : ''
+    if (!id) {
+      sendSecurityJson(res, 400, { ok: false, error: 'invalid_request' })
+      return
+    }
+
+    if (urlPath === '/_security/revoke') {
+      let result
+      try {
+        result = deviceRegistry.revokeDevice(id)
+      } catch (e) {
+        log(`吊销设备失败: ${e.message}`)
+        sendSecurityJson(res, 500, { ok: false, error: 'internal' })
+        return
+      }
+      if (!result.ok) {
+        sendSecurityJson(res, 404, { ok: false, error: 'not_found' })
+        return
+      }
+      auditEvent(AUDIT_EVENTS.REVOKE, {
+        deviceId: id,
+        ip: clientIp(req),
+        detail: 'POST /_security/revoke',
+      })
+      sendSecurityJson(res, 200, {
+        ok: true,
+        deviceId: id,
+        device: result.device,
+        alreadyRevoked: !!result.alreadyRevoked,
+      })
+      return
+    }
+
+    let rotated
+    try {
+      rotated = deviceRegistry.rotateKey(id)
+    } catch (e) {
+      log(`轮换设备密钥失败: ${e.message}`)
+      sendSecurityJson(res, 500, { ok: false, error: 'internal' })
+      return
+    }
+    if (!rotated || rotated.ok === false) {
+      // 注意：核心的 rotateKey 成功时返回 { id, key, name, createdAt }（没有
+      // ok 字段），失败才返回 { ok:false, reason } —— 不能直接写成 `!rotated.ok`。
+      const reason = (rotated && rotated.reason) || 'not-found'
+      sendSecurityJson(res, reason === 'not-found' ? 404 : 409, {
+        ok: false,
+        error: reason === 'not-found' ? 'not_found' : reason,
+      })
+      return
+    }
+    auditEvent('rotate', { deviceId: id, ip: clientIp(req), detail: 'POST /_security/rotate' })
+    // 新 key 同样只返回这一次。
+    sendSecurityJson(res, 200, {
+      ok: true,
+      deviceId: rotated.id,
+      key: rotated.key,
+      name: rotated.name,
+    })
+    return
+  }
+
+  sendSecurityJson(res, 404, { ok: false, error: 'not_found' })
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     await handleRequest(req, res)
@@ -500,6 +854,19 @@ async function handleRequest(req, res) {
   const urlPath = String(req.url || '').split('?')[0]
   if (urlPath === '/slots' || urlPath === '/metrics') {
     sendJson(res, 404, { error: { message: 'not found' } })
+    return
+  }
+
+  // ---- P1 配对 / 安全管理端点 ----
+  //
+  // /_pair 是公开入口（配对的设备还没有 key），靠限流 + 配对码 TTL/尝试上限
+  // 保护；/_security/* 是管理入口，复用 /_bridge 的 token 规则。
+  if (urlPath === '/_pair') {
+    await handlePairRequest(req, res)
+    return
+  }
+  if (urlPath === '/_security' || urlPath.startsWith('/_security/')) {
+    await handleSecurityRequest(req, res, urlPath)
     return
   }
 
@@ -598,6 +965,17 @@ async function handleRequest(req, res) {
     }
     res.writeHead(405); res.end('method not allowed')
     return
+  }
+
+  // ---- P1 限流与设备鉴权 ----
+  //
+  // 限流先于鉴权：否则攻击者可以无限次试设备 key。只覆盖 /v1/*；页面、面板
+  // 脚本与 /_bridge 的流量保持旧行为（面板本身不带设备 key）。
+  if (urlPath.startsWith('/v1/')) {
+    if (!enforceRateLimit(req, res, urlPath)) return
+  }
+  if (DEVICE_AUTH && isDeviceProtectedPath(urlPath)) {
+    if (!enforceDeviceAuth(req, res, urlPath)) return
   }
 
   // ---- 核心:拦截对话补全,做压缩 ----
@@ -753,6 +1131,13 @@ server.listen(PROXY_PORT, PROXY_HOST, () => {
   log(`  监听: http://${PROXY_HOST}:${PROXY_PORT}  ${lan ? '(局域网可访问)' : '(仅本机回环)'}`)
   log(`  上游: ${UPSTREAM}`)
   log(`  /_bridge: ${BRIDGE_TOKEN ? '已启用会话 token' : '未鉴权(未设置 PROXY_TOKEN)'}`)
+  // P1 安全接线状态：路径与开关都要能在日志里直接确认，排障时不用猜。
+  log(`  设备鉴权: ${DEVICE_AUTH
+    ? (DEVICE_AUTH_STRICT ? '开(严格：回环也校验)' : '开(回环豁免)')
+    : '关'}`)
+  log(`  设备注册表: ${DEVICES_FILE}`)
+  log(`  审计: ${AUDIT_FILE}`)
+  log(`  限流: 按 IP，容量 ${RATE_CAPACITY}，补充 ${RATE_REFILL_PER_SEC}/秒`)
   log(`  请求体上限: ${Math.round(MAX_BODY_BYTES / 1024 / 1024)} MiB  上游空闲超时: ${IDLE_TIMEOUT_MS}ms`)
   log(`  压缩: ${state.enabled ? '开启' : '关闭'}  阈值: 上下文的 ${state.thresholdRatio}`)
   log(`  保留最近 ${state.keepRecentTurns} 轮原文`)
